@@ -16,6 +16,14 @@ interface StratView {
   equityHistory: [number, number][];
 }
 
+interface Signal {
+  coin: string;
+  momentum24?: number | null;
+  smaSignal: number;
+  zscore?: number | null;
+  score: number;
+}
+
 interface StateResponse {
   initialised: boolean;
   note?: string;
@@ -25,6 +33,7 @@ interface StateResponse {
   tickCount?: number;
   prices?: Record<string, { bid: number; ask: number }>;
   strategies?: Record<string, StratView>;
+  signals?: Record<string, Signal>;
 }
 
 const aud = (n: number) => n.toLocaleString('en-AU', { style: 'currency', currency: 'AUD' });
@@ -57,6 +66,39 @@ function EquityChart({ strategies }: { strategies: Record<string, StratView> }) 
         />
       ))}
     </svg>
+  );
+}
+
+function SignalsPanel({ signals, prices }: { signals?: Record<string, Signal> | null; prices?: Record<string, { bid: number; ask: number }> }) {
+  if (!signals) return null;
+  const list = Object.values(signals).slice().sort((a, b) => b.score - a.score);
+  return (
+    <section className="card">
+      <h2>Per-coin signals</h2>
+      <p className="dim">Composite score shown alongside components. Positive score → buy candidate; negative → consider exit.</p>
+      <div className="signals-table">
+        <table>
+          <thead>
+            <tr><th>Coin</th><th>Price</th><th>24h</th><th>SMA</th><th>z-score</th><th>Score</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            {list.map((s) => (
+              <tr key={s.coin}>
+                <td>{s.coin.toUpperCase()}</td>
+                <td>{prices?.[s.coin] ? aud(prices[s.coin].bid) : '—'}</td>
+                <td className="dim">{s.momentum24 == null ? '—' : `${(s.momentum24 * 100).toFixed(2)}%`}</td>
+                <td className="dim">{s.smaSignal === 1 ? 'golden' : s.smaSignal === -1 ? 'death' : '—'}</td>
+                <td className="dim">{s.zscore == null ? '—' : s.zscore.toFixed(2)}</td>
+                <td style={{ fontWeight: 600 }}>{s.score.toFixed(3)}</td>
+                <td className={s.score > 0.15 ? 'up' : s.score < -0.1 ? 'down' : 'dim'}>
+                  {s.score > 0.15 ? 'Buy candidate' : s.score < -0.1 ? 'Sell candidate' : 'Hold / Monitor'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -137,6 +179,9 @@ export default function App() {
           ))}
         </section>
       )}
+
+      {/* signals panel */}
+      {data?.signals && <SignalsPanel signals={data.signals} prices={data.prices} />}
 
       {data?.strategies && (
         <>
