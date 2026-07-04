@@ -363,5 +363,3 @@ export function summarise(state: PaperState, ticks: Record<Coin, Tick>) {
   }
   return out;
 }
-
-export { computeSignals };
