@@ -1,5 +1,5 @@
 // Paper-trading read API + manual controls. Simulated money only — no exchange keys exist.
-import { COINS, fetchPrices, loadDay, loadRecent, loadState, runTick, summarise, type Coin } from './lib/paperEngine';
+import { COINS, currentSignals, fetchPrices, loadDay, loadRecent, loadState, runTick, summarise, type Coin } from './lib/paperEngine';
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -14,14 +14,16 @@ export default async function handler(request: Request) {
 
   if (request.method === 'GET' && route === '/paper/state') {
     const [state, ticks] = await Promise.all([loadState(), fetchPrices()]);
-    if (!state) return json({ initialised: false, note: 'No ticks collected yet. POST /paper/tick to seed, or wait for the 5-minute scheduler.' });
-    if (!ticks) return json({ initialised: true, error: 'CoinSpot unreachable right now' }, 502);
+    if (!ticks) return json({ initialised: Boolean(state), error: 'CoinSpot unreachable right now' }, 502);
+    const signals = await currentSignals(ticks);
+    if (!state) return json({ initialised: false, prices: ticks, signals, note: 'No ticks collected yet. Press "Run first tick now", or wait for the 5-minute scheduler.' });
     return json({
       initialised: true,
       startedAt: state.startedAt,
       lastTick: state.lastTick,
       tickCount: state.tickCount,
       prices: ticks,
+      signals,
       strategies: summarise(state, ticks),
     });
   }
