@@ -88,6 +88,13 @@ export default function App() {
     setSeeding(false);
   };
 
+  const runTickNow = async () => {
+    setSeeding(true);
+    await fetch('/paper/tick', { method: 'POST' }).catch(() => {});
+    await refresh();
+    setSeeding(false);
+  };
+
   const allTrades = useMemo(() => {
     if (!data?.strategies) return [];
     return Object.values(data.strategies)
@@ -103,7 +110,11 @@ export default function App() {
           <h1>Scarlett Paper Trader</h1>
           <p className="sub">Simulated crypto strategies on live CoinSpot prices. No real money. No exchange keys. The point is to find out — with evidence — whether any strategy beats simply holding.</p>
         </div>
-        {data?.lastTick ? <div className="pill">Last tick {ts(data.lastTick)} · {data.tickCount} ticks</div> : null}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button onClick={refresh} title="Refresh data">Refresh</button>
+          <button onClick={runTickNow} disabled={seeding} title="Run one tick now">{seeding ? 'Running…' : 'Run tick'}</button>
+          {data?.lastTick ? <div className="pill">Last tick {ts(data.lastTick)} · {data.tickCount} ticks</div> : null}
+        </div>
       </header>
 
       {err && <div className="banner error">Dashboard could not reach the API: {err}</div>}
