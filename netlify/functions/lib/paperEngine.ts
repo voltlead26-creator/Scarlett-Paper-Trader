@@ -2,16 +2,19 @@
 // No exchange keys exist anywhere in this system. Nothing here can place a real trade.
 import { getStore } from '@netlify/blobs';
 
-export const COINS = ['btc', 'eth', 'sol', 'xrp', 'doge'] as const;
+export const COINS = [
+  'btc','eth','sol','xrp','doge','zec','avax','dash','hype','comp','epic','link','inj','nmr','near','mnt','dfi','dot','sui','arb','rndr','tao'
+] as const;
 export type Coin = (typeof COINS)[number];
 
-const TRADE_COINS: Coin[] = ['btc', 'eth'];
+const TRADE_COINS: Coin[] = [...COINS];
 const FEE = 0.001; // CoinSpot market order fee, 0.1% per side
-const START_CASH = 10000; // virtual AUD per strategy
+export const START_CASH = 10000; // virtual AUD total across all strategies
 const TICKS_PER_DAY = 288; // 5-minute cadence
 const RECENT_CAP = TICKS_PER_DAY * 8;
 const TRADES_CAP = 400;
 const EQUITY_CAP = 2400; // hourly snapshots ≈ 100 days
+const DUST = 5; // lower dust cutoff to allow many small buys
 
 export interface Tick { t: number; bid: number; ask: number }
 export interface Trade {
@@ -38,11 +41,11 @@ export interface PaperState {
 export const STRATEGY_IDS = ['hold', 'dca', 'sma', 'momentum', 'meanrev'] as const;
 
 export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
-  hold: { name: 'Buy & Hold', blurb: 'Benchmark. 50/50 BTC/ETH at first tick, never trades again. Every other strategy must beat this to justify existing.' },
-  dca: { name: 'Daily DCA', blurb: 'Buys ~$110 of BTC/ETH each day regardless of price until cash runs out.' },
-  sma: { name: 'SMA Crossover', blurb: '1-hour vs 6-hour moving average on BTC and ETH. Buys on golden cross, sells on death cross.' },
-  momentum: { name: 'Momentum', blurb: 'Buys when 24h return exceeds +1.5%, exits when momentum turns negative or price drops 3% from entry.' },
-  meanrev: { name: 'Mean Reversion', blurb: 'Buys when price is 2+ standard deviations below its 24h mean, exits at the mean or on a 5% stop.' },
+  hold: { name: 'Buy & Hold', blurb: 'Benchmark. Allocates the starting cash evenly across the tracked coins and holds unless signals indicate repositioning.' },
+  dca: { name: 'Daily DCA', blurb: 'Opportunistic DCA: daily buys into long-hold candidates when they show persistent positive signals.' },
+  sma: { name: 'SMA Crossover', blurb: 'Fast vs slow simple moving average cross strategy applied per coin; enters on golden cross, exits on death cross.' },
+  momentum: { name: 'Momentum', blurb: 'Buys coins showing strong 24h momentum, exits when momentum weakens or a stop loss hits.' },
+  meanrev: { name: 'Mean Reversion', blurb: 'Buys coins when price is significantly below their recent mean and exits on reversion or stop loss.' },
 };
 
 const store = () => getStore('paper-trading');
@@ -57,13 +60,26 @@ export async function fetchPrices(): Promise<Record<Coin, Tick> | null> {
     if (json.status !== 'ok') return null;
     const t = Math.floor(Date.now() / 1000);
     const out = {} as Record<Coin, Tick>;
+    const s = store();
     for (const c of COINS) {
       const p = json.prices[c];
-      if (!p) return null;
-      const bid = Number(p.bid);
-      const ask = Number(p.ask);
-      if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return null;
-      out[c] = { t, bid, ask };
+      if (p) {
+        const bid = Number(p.bid);
+        const ask = Number(p.ask);
+        if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) {
+          // try fallback to most recent stored tick
+          const recent = (await s.get(`recent:${c}`, { type: 'json' })) as Tick[] | null;
+          if (recent && recent.length) out[c] = { ...recent[recent.length - 1], t };
+          else return null;
+        } else {
+          out[c] = { t, bid, ask };
+        }
+      } else {
+        // coin missing from CoinSpot response: fallback to stored recent tick if available
+        const recent = (await s.get(`recent:${c}`, { type: 'json' })) as Tick[] | null;
+        if (recent && recent.length) out[c] = { ...recent[recent.length - 1], t };
+        else return null;
+      }
     }
     return out;
   } catch {
@@ -71,13 +87,19 @@ export async function fetchPrices(): Promise<Record<Coin, Tick> | null> {
   }
 }
 
-function freshStrat(): StratState {
-  return { cash: START_CASH, positions: {}, trades: [], equity: [], realisedPnl: 0, wins: 0, losses: 0 };
+function freshStrat(cash: number): StratState {
+  return { cash, positions: {}, trades: [], equity: [], realisedPnl: 0, wins: 0, losses: 0 };
 }
 
 export function freshState(now: number): PaperState {
   const strategies: Record<string, StratState> = {};
-  for (const id of STRATEGY_IDS) strategies[id] = freshStrat();
+  // split START_CASH 50/50 between day-trading and long-hold
+  const dayIds = ['sma', 'momentum', 'meanrev'];
+  const longIds = ['hold', 'dca'];
+  const dayTotal = START_CASH * 0.5;
+  const longTotal = START_CASH * 0.5;
+  for (const id of dayIds) strategies[id] = freshStrat(dayTotal / dayIds.length);
+  for (const id of longIds) strategies[id] = freshStrat(longTotal / longIds.length);
   return { startedAt: now, lastTick: 0, tickCount: 0, strategies };
 }
 
@@ -108,7 +130,7 @@ async function appendHistory(coin: Coin, tick: Tick, recent: Tick[]) {
 // ---- trade primitives: buy at ask, sell at bid, fee both sides ----
 function buy(st: StratState, id: string, coin: Coin, tick: Tick, cashToSpend: number, reason: string) {
   const spend = Math.min(cashToSpend, st.cash);
-  if (spend < 10) return; // ignore dust orders
+  if (spend < DUST) return; // ignore dust orders
   const fee = spend * FEE;
   const units = (spend - fee) / tick.ask;
   st.cash -= spend;
@@ -154,79 +176,132 @@ const sma = (xs: number[], n: number) => {
   return s / n;
 };
 
+export function computeSignals(recents: Record<Coin, Tick[]>, ticks: Record<Coin, Tick>) {
+  // returns per-coin components and composite score
+  const scores: Record<string, { coin: Coin; momentum24: number | null; smaSignal: number; zscore: number | null; score: number }> = {} as any;
+  for (const c of TRADE_COINS) {
+    const xs = recents[c] ? recents[c].map(mid) : [];
+    const last = xs.length ? xs[xs.length - 1] : null;
+
+    // momentum: 24h lookback
+    let mom: number | null = null;
+    if (xs.length >= TICKS_PER_DAY + 1) {
+      mom = xs[xs.length - 1] / xs[xs.length - 1 - TICKS_PER_DAY] - 1;
+    }
+
+    // SMA signal
+    const fast = sma(xs, 12);
+    const slow = sma(xs, 72);
+    const fastPrev = xs.length > 1 ? sma(xs.slice(0, -1), 12) : null;
+    const slowPrev = xs.length > 1 ? sma(xs.slice(0, -1), 72) : null;
+    let smaSignal = 0;
+    if (fast != null && slow != null && fastPrev != null && slowPrev != null) {
+      if (fastPrev <= slowPrev && fast > slow) smaSignal = 1;
+      else if (fastPrev >= slowPrev && fast < slow) smaSignal = -1;
+    }
+
+    // z-score vs 24h window
+    let z: number | null = null;
+    if (xs.length >= TICKS_PER_DAY) {
+      const win = xs.slice(-TICKS_PER_DAY);
+      const mean = win.reduce((a, b) => a + b, 0) / win.length;
+      const sd = Math.sqrt(win.reduce((a, b) => a + (b - mean) ** 2, 0) / win.length);
+      if (sd > 0) z = (xs[xs.length - 1] - mean) / sd;
+    }
+
+    // composite score: weights tuned for day trading relevance
+    const w_mom = 0.5, w_sma = 0.3, w_z = 0.2;
+    const momVal = mom ?? 0;
+    const zVal = z ?? 0;
+    // transform z so that negative z (price below mean) increases buy score
+    const zScoreComponent = -Math.min(Math.max(zVal, -5), 5) / 5; // in [-1,1]
+
+    const score = w_mom * momVal + w_sma * smaSignal + w_z * zScoreComponent;
+
+    scores[c] = { coin: c, momentum24: mom, smaSignal, zscore: z, score } as any;
+  }
+  return scores;
+}
+
 // ---- strategy logic, one tick ----
 function runStrategies(state: PaperState, ticks: Record<Coin, Tick>, recents: Record<Coin, Tick[]>) {
   const S = state.strategies;
-  const mids: Record<string, number[]> = {};
-  for (const c of TRADE_COINS) mids[c] = recents[c].map(mid);
+  const signals = computeSignals(recents, ticks);
 
-  // 1) Buy & Hold benchmark — one-shot
-  const hold = S.hold;
-  if (hold.trades.length === 0 && hold.cash >= START_CASH - 1) {
-    buy(hold, 'hold', 'btc', ticks.btc, hold.cash / 2, 'benchmark initial 50%');
-    buy(hold, 'hold', 'eth', ticks.eth, hold.cash, 'benchmark initial 50%');
-  }
+  // decide day-trade candidates
+  const dayCandidates = Object.values(signals)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6) // top N
+    .filter((s) => s.score > 0.15);
 
-  // 2) Daily DCA
-  const dca = S.dca;
-  if (state.tickCount % TICKS_PER_DAY === 0 && dca.cash > 20) {
-    const daily = Math.min(110, dca.cash);
-    buy(dca, 'dca', 'btc', ticks.btc, daily / 2, 'daily DCA');
-    buy(dca, 'dca', 'eth', ticks.eth, Math.min(daily / 2, dca.cash), 'daily DCA');
-  }
+  // decide long-hold candidates
+  const longCandidates = Object.values(signals)
+    .sort((a, b) => (b.momentum24 ?? 0) - (a.momentum24 ?? 0))
+    .slice(0, 5)
+    .filter((s) => (s.momentum24 ?? 0) > 0 || (s.score > 0.1));
 
-  // 3) SMA crossover (fast 1h=12 ticks vs slow 6h=72 ticks), per coin with half the book each
-  const smaSt = S.sma;
-  for (const c of TRADE_COINS) {
-    const xs = mids[c];
-    const fast = sma(xs, 12);
-    const slow = sma(xs, 72);
-    const fastPrev = sma(xs.slice(0, -1), 12);
-    const slowPrev = sma(xs.slice(0, -1), 72);
-    if (fast == null || slow == null || fastPrev == null || slowPrev == null) continue;
-    const inPos = Boolean(smaSt.positions[c]);
-    if (!inPos && fastPrev <= slowPrev && fast > slow) {
-      const other = TRADE_COINS.find((x) => x !== c) as Coin;
-      const spend = smaSt.positions[other] ? smaSt.cash : smaSt.cash / 2;
-      buy(smaSt, 'sma', c, ticks[c], spend, `golden cross ${c.toUpperCase()}`);
-    } else if (inPos && fastPrev >= slowPrev && fast < slow) {
-      sellAll(smaSt, 'sma', c, ticks[c], `death cross ${c.toUpperCase()}`);
+  // DAY-TRADING: allocate from sma, momentum, meanrev strategies (each has its own cash)
+  const dayStratIds: (keyof typeof STRATEGY_META)[] = ['sma', 'momentum', 'meanrev'];
+  for (const id of dayStratIds) {
+    const st = S[id];
+    if (!st) continue;
+    // compute positive scores for selected candidates
+    const positives = dayCandidates.map((c) => ({ coin: c.coin as Coin, score: Math.max(c.score, 0) }));
+    const totalScore = positives.reduce((a, b) => a + b.score, 0);
+    if (totalScore <= 0) {
+      // consider selling if positions exist and score turned negative
+      for (const [coinStr, pos] of Object.entries(st.positions)) {
+        const coin = coinStr as Coin;
+        const s = signals[coin];
+        if (!s || s.score < 0) sellAll(st, id, coin, ticks[coin], `exit negative score ${s ? s.score.toFixed(3) : 'n/a'}`);
+      }
+      continue;
+    }
+    // per-tick cap: spend at most 50% of cash
+    const cap = st.cash * 0.5;
+    for (const p of positives) {
+      const alloc = (p.score / totalScore) * cap;
+      if (alloc >= DUST) buy(st, id, p.coin, ticks[p.coin], alloc, `day-trade allocation based on score ${p.score.toFixed(3)}`);
+    }
+    // also evaluate stop-losses for existing positions in this strategy
+    for (const [coinStr, pos] of Object.entries(st.positions)) {
+      const coin = coinStr as Coin;
+      const entry = pos!.entry;
+      const drawdown = ticks[coin].bid / entry - 1;
+      if (drawdown < -0.05) sellAll(st, id, coin, ticks[coin], 'stop loss -5%');
     }
   }
 
-  // 4) Momentum: 24h lookback
-  const mom = S.momentum;
-  for (const c of TRADE_COINS) {
-    const xs = mids[c];
-    if (xs.length < TICKS_PER_DAY + 1) continue;
-    const ret24 = xs[xs.length - 1] / xs[xs.length - 1 - TICKS_PER_DAY] - 1;
-    const pos = mom.positions[c];
-    if (!pos && ret24 > 0.015) {
-      buy(mom, 'momentum', c, ticks[c], mom.cash / 2, `24h momentum +${(ret24 * 100).toFixed(2)}%`);
-    } else if (pos) {
-      const drawdown = ticks[c].bid / pos.entry - 1;
-      if (ret24 < 0) sellAll(mom, 'momentum', c, ticks[c], 'momentum turned negative');
-      else if (drawdown < -0.03) sellAll(mom, 'momentum', c, ticks[c], 'stop loss -3%');
+  // LONG-HOLD: hold and dca strategies act as the long book
+  const longStratIds: (keyof typeof STRATEGY_META)[] = ['hold', 'dca'];
+  for (const id of longStratIds) {
+    const st = S[id];
+    if (!st) continue;
+    // buy top longCandidates if not already held
+    const candidates = longCandidates.map((c) => c.coin as Coin);
+    const notHeld = candidates.filter((c) => !st.positions[c]);
+    if (notHeld.length) {
+      const per = Math.min(st.cash / notHeld.length, st.cash * 0.5);
+      for (const c of notHeld) {
+        buy(st, id, c, ticks[c], per, `long-hold entry ${c.toUpperCase()}`);
+      }
     }
-  }
-
-  // 5) Mean reversion: z-score vs 24h window
-  const mr = S.meanrev;
-  for (const c of TRADE_COINS) {
-    const xs = mids[c];
-    if (xs.length < TICKS_PER_DAY) continue;
-    const win = xs.slice(-TICKS_PER_DAY);
-    const mean = win.reduce((a, b) => a + b, 0) / win.length;
-    const sd = Math.sqrt(win.reduce((a, b) => a + (b - mean) ** 2, 0) / win.length);
-    if (sd <= 0) continue;
-    const z = (xs[xs.length - 1] - mean) / sd;
-    const pos = mr.positions[c];
-    if (!pos && z < -2) {
-      buy(mr, 'meanrev', c, ticks[c], mr.cash / 2, `z-score ${z.toFixed(2)} below mean`);
-    } else if (pos) {
-      const drawdown = ticks[c].bid / pos.entry - 1;
-      if (z >= 0) sellAll(mr, 'meanrev', c, ticks[c], 'reverted to mean');
-      else if (drawdown < -0.05) sellAll(mr, 'meanrev', c, ticks[c], 'stop loss -5%');
+    // opportunistic DCA on daily ticks for dca strategy
+    if (id === 'dca' && state.tickCount % TICKS_PER_DAY === 0 && st.cash > DUST) {
+      for (const c of candidates) {
+        // buy only if persistent positive momentum
+        const s = signals[c];
+        if (s && (s.momentum24 ?? 0) > 0.01) buy(st, id, c, ticks[c], Math.min(110 / candidates.length, st.cash), 'opportunistic DCA');
+      }
+    }
+    // long-hold exit rules: exit if strong negative momentum or large stop-loss
+    for (const [coinStr, pos] of Object.entries(st.positions)) {
+      const coin = coinStr as Coin;
+      const s = signals[coin];
+      const entry = pos!.entry;
+      const drawdown = ticks[coin].bid / entry - 1;
+      if (s && (s.momentum24 ?? 0) < -0.05) sellAll(st, id, coin, ticks[coin], 'long exit: negative momentum');
+      else if (drawdown < -0.10) sellAll(st, id, coin, ticks[coin], 'long stop loss -10%');
     }
   }
 
@@ -288,3 +363,5 @@ export function summarise(state: PaperState, ticks: Record<Coin, Tick>) {
   }
   return out;
 }
+
+export { computeSignals };
