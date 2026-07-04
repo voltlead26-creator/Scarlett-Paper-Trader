@@ -105,6 +105,66 @@ function SignalsPanel({ signals, prices }: { signals?: Record<string, Signal> | 
   );
 }
 
+function PortfolioPanel() {
+  const [state, setState] = useState<{ phase: 'idle' | 'needtoken' | 'loading' | 'ready' | 'off' | 'error'; rows?: { coin: string; balance: number; aud: number }[]; msg?: string }>({ phase: 'idle' });
+
+  const load = async (token: string | null) => {
+    setState({ phase: 'loading' });
+    try {
+      const res = await fetch('/paper/portfolio', token ? { headers: { 'x-dashboard-token': token } } : undefined);
+      const body = await res.json();
+      if (body.configured === false) { setState({ phase: 'off', msg: body.note }); return; }
+      if (res.status === 401 || res.status === 403) { setState({ phase: 'needtoken', msg: body.error }); return; }
+      if (!res.ok) { setState({ phase: 'error', msg: body.error ?? `HTTP ${res.status}` }); return; }
+      // CoinSpot balances arrive as an array of single-key objects; flatten defensively
+      const raw = body.balances?.balances ?? body.balances?.balance ?? [];
+      const rows: { coin: string; balance: number; aud: number }[] = [];
+      const push = (coin: string, v: any) => rows.push({ coin, balance: Number(v?.balance ?? 0), aud: Number(v?.audbalance ?? 0) });
+      if (Array.isArray(raw)) for (const entry of raw) for (const [coin, v] of Object.entries(entry as object)) push(coin, v);
+      else if (raw && typeof raw === 'object') for (const [coin, v] of Object.entries(raw as object)) push(coin, v);
+      rows.sort((a, b) => b.aud - a.aud);
+      setState({ phase: 'ready', rows });
+    } catch (e) {
+      setState({ phase: 'error', msg: String(e) });
+    }
+  };
+
+  useEffect(() => { load(localStorage.getItem('dashToken')); }, []);
+
+  if (state.phase === 'off') return null;
+
+  return (
+    <section className="card">
+      <h2>Your real CoinSpot account (read-only)</h2>
+      {state.phase === 'loading' && <p className="dim">Loading…</p>}
+      {state.phase === 'needtoken' && (
+        <div className="banner">
+          <p>Enter your dashboard token to view real balances. {state.msg}</p>
+          <button onClick={() => { const t = window.prompt('Dashboard token'); if (t) { localStorage.setItem('dashToken', t); load(t); } }}>Enter token</button>
+        </div>
+      )}
+      {state.phase === 'error' && <div className="banner error">{state.msg}</div>}
+      {state.phase === 'ready' && state.rows && (
+        state.rows.filter((r) => r.balance > 0).length === 0 ? <p className="dim">No holdings returned.</p> : (
+          <table>
+            <thead><tr><th>Coin</th><th>Balance</th><th>Value (AUD)</th></tr></thead>
+            <tbody>
+              {state.rows.filter((r) => r.balance > 0).map((r) => (
+                <tr key={r.coin}>
+                  <td>{r.coin.toUpperCase()}</td>
+                  <td>{r.balance}</td>
+                  <td>{aud(r.aud)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )
+      )}
+      <p className="dim" style={{ marginTop: 8 }}>Read-only key: this dashboard can view your account but can never trade on it. Your paper strategies remain fully simulated.</p>
+    </section>
+  );
+}
+
 export default function App() {
   const [data, setData] = useState<StateResponse | null>(null);
   const [err, setErr] = useState('');
@@ -178,6 +238,8 @@ export default function App() {
       )}
 
       {data?.signals && <SignalsPanel signals={data.signals} prices={data.prices} />}
+
+      <PortfolioPanel />
 
       {data?.strategies && (
         <>
