@@ -9,7 +9,7 @@ const COLORS: Record<string, string> = {
 };
 
 interface StratView {
-  name: string; blurb: string; cash: number; equity: number; returnPct: number;
+  name: string; blurb: string; cash: number; startCash: number; equity: number; returnPct: number;
   realisedPnl: number; wins: number; losses: number;
   openPositions: Record<string, { units: number; entry: number; markToBid: number }>;
   trades: { t: number; coin: string; side: string; units: number; price: number; fee: number; reason: string; strategy: string }[];
@@ -40,29 +40,32 @@ const aud = (n: number) => n.toLocaleString('en-AU', { style: 'currency', curren
 const ts = (t: number) => new Date(t * 1000).toLocaleString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 
 function EquityChart({ strategies }: { strategies: Record<string, StratView> }) {
-  const series = Object.entries(strategies).filter(([, s]) => s.equityHistory.length > 1);
+  // Books start with different cash, so plot each curve as % of its own start (100 = flat)
+  const series = Object.entries(strategies)
+    .filter(([, s]) => s.equityHistory.length > 1 && s.startCash > 0)
+    .map(([id, s]) => ({ id, points: s.equityHistory.map(([t, v]) => [t, (v / s.startCash) * 100] as [number, number]) }));
   if (series.length === 0) {
     return <div className="chart-empty">Equity curves appear once a few hours of data exist. The collector snapshots every hour.</div>;
   }
-  const all = series.flatMap(([, s]) => s.equityHistory);
+  const all = series.flatMap((s) => s.points);
   const tMin = Math.min(...all.map((p) => p[0]));
   const tMax = Math.max(...all.map((p) => p[0]));
-  const vMin = Math.min(10000, ...all.map((p) => p[1])) * 0.995;
-  const vMax = Math.max(10000, ...all.map((p) => p[1])) * 1.005;
+  const vMin = Math.min(100, ...all.map((p) => p[1])) * 0.998;
+  const vMax = Math.max(100, ...all.map((p) => p[1])) * 1.002;
   const W = 900; const H = 260; const PAD = 8;
   const x = (t: number) => PAD + ((t - tMin) / Math.max(1, tMax - tMin)) * (W - PAD * 2);
-  const y = (v: number) => H - PAD - ((v - vMin) / Math.max(1, vMax - vMin)) * (H - PAD * 2);
+  const y = (v: number) => H - PAD - ((v - vMin) / Math.max(0.0001, vMax - vMin)) * (H - PAD * 2);
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="chart">
-      <line x1={PAD} x2={W - PAD} y1={y(10000)} y2={y(10000)} stroke="#2B2521" strokeDasharray="4 4" strokeOpacity="0.35" />
-      <text x={W - PAD - 4} y={y(10000) - 5} textAnchor="end" fontSize="11" fill="#2B2521" opacity="0.6">$10,000 start</text>
-      {series.map(([id, s]) => (
+      <line x1={PAD} x2={W - PAD} y1={y(100)} y2={y(100)} stroke="#2B2521" strokeDasharray="4 4" strokeOpacity="0.35" />
+      <text x={W - PAD - 4} y={y(100) - 5} textAnchor="end" fontSize="11" fill="#2B2521" opacity="0.6">100% = starting cash</text>
+      {series.map((s) => (
         <polyline
-          key={id}
+          key={s.id}
           fill="none"
-          stroke={COLORS[id] ?? '#2B2521'}
-          strokeWidth={id === 'hold' ? 2.5 : 1.6}
-          points={s.equityHistory.map(([t, v]) => `${x(t)},${y(v)}`).join(' ')}
+          stroke={COLORS[s.id] ?? '#2B2521'}
+          strokeWidth={s.id === 'hold' ? 2.5 : 1.6}
+          points={s.points.map(([t, v]) => `${x(t)},${y(v)}`).join(' ')}
         />
       ))}
     </svg>
@@ -70,12 +73,12 @@ function EquityChart({ strategies }: { strategies: Record<string, StratView> }) 
 }
 
 function SignalsPanel({ signals, prices }: { signals?: Record<string, Signal> | null; prices?: Record<string, { bid: number; ask: number }> }) {
-  if (!signals) return null;
+  if (!signals || Object.keys(signals).length === 0) return null;
   const list = Object.values(signals).slice().sort((a, b) => b.score - a.score);
   return (
     <section className="card">
       <h2>Per-coin signals</h2>
-      <p className="dim">Composite score shown alongside components. Positive score → buy candidate; negative → consider exit.</p>
+      <p className="dim">Composite score with components. Positive score → buy candidate; negative → exit candidate. Components need up to 24h of history before they populate.</p>
       <div className="signals-table">
         <table>
           <thead>
@@ -105,7 +108,7 @@ function SignalsPanel({ signals, prices }: { signals?: Record<string, Signal> | 
 export default function App() {
   const [data, setData] = useState<StateResponse | null>(null);
   const [err, setErr] = useState('');
-  const [seeding, setSeeding] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const refresh = async () => {
     try {
@@ -123,18 +126,11 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  const seed = async () => {
-    setSeeding(true);
-    await fetch('/paper/tick', { method: 'POST' }).catch(() => {});
-    await refresh();
-    setSeeding(false);
-  };
-
   const runTickNow = async () => {
-    setSeeding(true);
+    setBusy(true);
     await fetch('/paper/tick', { method: 'POST' }).catch(() => {});
     await refresh();
-    setSeeding(false);
+    setBusy(false);
   };
 
   const allTrades = useMemo(() => {
@@ -154,17 +150,18 @@ export default function App() {
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button onClick={refresh} title="Refresh data">Refresh</button>
-          <button onClick={runTickNow} disabled={seeding} title="Run one tick now">{seeding ? 'Running…' : 'Run tick'}</button>
+          <button onClick={runTickNow} disabled={busy} title="Run one tick now">{busy ? 'Running…' : 'Run tick'}</button>
           {data?.lastTick ? <div className="pill">Last tick {ts(data.lastTick)} · {data.tickCount} ticks</div> : null}
         </div>
       </header>
 
       {err && <div className="banner error">Dashboard could not reach the API: {err}</div>}
+      {data?.error && <div className="banner error">{data.error}</div>}
 
-      {data && !data.initialised && (
+      {data && !data.initialised && !data.error && (
         <div className="banner">
-          <p>{data.note}</p>
-          <button onClick={seed} disabled={seeding}>{seeding ? 'Seeding…' : 'Run first tick now'}</button>
+          <p>{data.note ?? 'No data yet.'}</p>
+          <button onClick={runTickNow} disabled={busy}>{busy ? 'Seeding…' : 'Run first tick now'}</button>
         </div>
       )}
 
@@ -180,13 +177,12 @@ export default function App() {
         </section>
       )}
 
-      {/* signals panel */}
       {data?.signals && <SignalsPanel signals={data.signals} prices={data.prices} />}
 
       {data?.strategies && (
         <>
           <section className="card">
-            <h2>Equity — every strategy vs the $10k it started with</h2>
+            <h2>Equity — each strategy as a percentage of its own starting cash</h2>
             <EquityChart strategies={data.strategies} />
             <div className="legend">
               {Object.entries(data.strategies).map(([id, s]) => (
@@ -203,7 +199,7 @@ export default function App() {
                 <div className="figures">
                   <div><label>Equity</label><strong>{aud(s.equity)}</strong></div>
                   <div><label>Return</label><strong className={s.returnPct >= 0 ? 'up' : 'down'}>{s.returnPct >= 0 ? '+' : ''}{s.returnPct}%</strong></div>
-                  <div><label>Realised P&L</label><strong>{aud(s.realisedPnl)}</strong></div>
+                  <div><label>Started with</label><strong>{aud(s.startCash)}</strong></div>
                   <div><label>Closed W/L</label><strong>{s.wins}/{s.losses}</strong></div>
                 </div>
                 {Object.keys(s.openPositions).length > 0 && (
@@ -245,7 +241,7 @@ export default function App() {
       )}
 
       <footer>
-        Prices: CoinSpot public API, 5-minute cadence. Fills simulated at ask (buy) / bid (sell) with 0.1% fee per side.
+        Prices: CoinSpot public API, 5-minute cadence, {`10 tracked coins`}. Fills simulated at ask (buy) / sell at bid with 0.1% fee per side.
         This is an experiment log, not financial advice — and results here do not predict live-trading results.
       </footer>
     </div>
