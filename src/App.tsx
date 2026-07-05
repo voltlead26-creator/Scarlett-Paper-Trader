@@ -6,12 +6,13 @@ const COLORS: Record<string, string> = {
   sma: '#C8442B',
   momentum: '#E0883C',
   meanrev: '#5B7B6C',
+  scalper: '#7B5EA7',
 };
 
 interface StratView {
   name: string; blurb: string; cash: number; startCash: number; equity: number; returnPct: number;
   realisedPnl: number; wins: number; losses: number;
-  openPositions: Record<string, { units: number; entry: number; markToBid: number }>;
+  openPositions: Record<string, { units: number; entry: number; markToBid: number; entryTick?: number }>;
   trades: { t: number; coin: string; side: string; units: number; price: number; fee: number; reason: string; strategy: string }[];
   equityHistory: [number, number][];
 }
@@ -22,6 +23,7 @@ interface Signal {
   smaSignal: number;
   zscore?: number | null;
   score: number;
+  scalperSignal?: string | null;
 }
 
 interface StateResponse {
@@ -40,7 +42,6 @@ const aud = (n: number) => n.toLocaleString('en-AU', { style: 'currency', curren
 const ts = (t: number) => new Date(t * 1000).toLocaleString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
 
 function EquityChart({ strategies }: { strategies: Record<string, StratView> }) {
-  // Books start with different cash, so plot each curve as % of its own start (100 = flat)
   const series = Object.entries(strategies)
     .filter(([, s]) => s.equityHistory.length > 1 && s.startCash > 0)
     .map(([id, s]) => ({ id, points: s.equityHistory.map(([t, v]) => [t, (v / s.startCash) * 100] as [number, number]) }));
@@ -82,7 +83,7 @@ function SignalsPanel({ signals, prices }: { signals?: Record<string, Signal> | 
       <div className="signals-table">
         <table>
           <thead>
-            <tr><th>Coin</th><th>Price</th><th>24h</th><th>SMA</th><th>z-score</th><th>Score</th><th>Action</th></tr>
+            <tr><th>Coin</th><th>Price</th><th>24h</th><th>SMA</th><th>z-score</th><th>Score</th><th>Scalp signal</th><th>Action</th></tr>
           </thead>
           <tbody>
             {list.map((s) => (
@@ -93,6 +94,7 @@ function SignalsPanel({ signals, prices }: { signals?: Record<string, Signal> | 
                 <td className="dim">{s.smaSignal === 1 ? 'golden' : s.smaSignal === -1 ? 'death' : '—'}</td>
                 <td className="dim">{s.zscore == null ? '—' : s.zscore.toFixed(2)}</td>
                 <td style={{ fontWeight: 600 }}>{s.score.toFixed(3)}</td>
+                <td className={s.scalperSignal ? 'up' : 'dim'}>{s.scalperSignal ?? '—'}</td>
                 <td className={s.score > 0.15 ? 'up' : s.score < -0.1 ? 'down' : 'dim'}>
                   {s.score > 0.15 ? 'Buy candidate' : s.score < -0.1 ? 'Sell candidate' : 'Hold / Monitor'}
                 </td>
@@ -116,7 +118,6 @@ function PortfolioPanel() {
       if (body.configured === false) { setState({ phase: 'off', msg: body.note }); return; }
       if (res.status === 401 || res.status === 403) { setState({ phase: 'needtoken', msg: body.error }); return; }
       if (!res.ok) { setState({ phase: 'error', msg: body.error ?? `HTTP ${res.status}` }); return; }
-      // CoinSpot balances arrive as an array of single-key objects; flatten defensively
       const raw = body.balances?.balances ?? body.balances?.balance ?? [];
       const rows: { coin: string; balance: number; aud: number }[] = [];
       const push = (coin: string, v: any) => rows.push({ coin, balance: Number(v?.balance ?? 0), aud: Number(v?.audbalance ?? 0) });
@@ -198,7 +199,7 @@ export default function App() {
     return Object.values(data.strategies)
       .flatMap((s) => s.trades)
       .sort((a, b) => b.t - a.t)
-      .slice(0, 30);
+      .slice(0, 50);
   }, [data]);
 
   return (
@@ -255,7 +256,7 @@ export default function App() {
 
           <section className="grid">
             {Object.entries(data.strategies).map(([id, s]) => (
-              <div key={id} className="card strat" style={{ borderTopColor: COLORS[id] }}>
+              <div key={id} className="card strat" style={{ borderTopColor: COLORS[id] ?? '#2B2521' }}>
                 <h3>{s.name}</h3>
                 <p className="blurb">{s.blurb}</p>
                 <div className="figures">
@@ -267,7 +268,7 @@ export default function App() {
                 {Object.keys(s.openPositions).length > 0 && (
                   <div className="positions">
                     {Object.entries(s.openPositions).map(([c, p]) => (
-                      <span key={c}>{c.toUpperCase()} {p.units.toFixed(5)} @ {aud(p.entry)} → {aud(p.markToBid)}</span>
+                      <span key={c}>{c.toUpperCase()} {p.units.toFixed(6)} @ {aud(p.entry)} → {aud(p.markToBid)}{p.entryTick != null ? ` (t${p.entryTick})` : ''}</span>
                     ))}
                   </div>
                 )}
@@ -276,15 +277,15 @@ export default function App() {
           </section>
 
           <section className="card">
-            <h2>Recent simulated trades (all strategies)</h2>
+            <h2>Recent simulated trades — all strategies</h2>
             {allTrades.length === 0 ? (
-              <p className="dim">No trades yet. Most strategies need 6–24 hours of price history before their first signal — this is expected, not broken.</p>
+              <p className="dim">No trades yet. Most strategies need 6–24 hours of price history before their first signal — this is expected, not broken. The scalper fires after 15 ticks (~75 min).</p>
             ) : (
               <table>
                 <thead><tr><th>When</th><th>Strategy</th><th>Side</th><th>Coin</th><th>Units</th><th>Price</th><th>Fee</th><th>Reason</th></tr></thead>
                 <tbody>
                   {allTrades.map((t, i) => (
-                    <tr key={i}>
+                    <tr key={i} style={t.strategy === 'scalper' ? { background: 'rgba(123,94,167,0.06)' } : undefined}>
                       <td>{ts(t.t)}</td>
                       <td>{t.strategy}</td>
                       <td className={t.side === 'buy' ? 'up' : 'down'}>{t.side}</td>
@@ -303,7 +304,7 @@ export default function App() {
       )}
 
       <footer>
-        Prices: CoinSpot public API, 5-minute cadence, {`10 tracked coins`}. Fills simulated at ask (buy) / sell at bid with 0.1% fee per side.
+        Prices: CoinSpot public API, 5-minute cadence, 10 tracked coins. Fills simulated at ask (buy) / bid (sell) with 0.1% fee per side.
         This is an experiment log, not financial advice — and results here do not predict live-trading results.
       </footer>
     </div>
