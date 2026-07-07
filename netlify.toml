@@ -5,3 +5,13 @@ publish = "dist"
 [functions]
 directory = "netlify/functions"
 node_bundler = "esbuild"
+
+[[redirects]]
+from = "/paper/*"
+to = "/.netlify/functions/paper/:splat"
+status = 200
+
+[[redirects]]
+from = "/paper"
+to = "/.netlify/functions/paper"
+status = 200
