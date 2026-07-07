@@ -1,5 +1,11 @@
 import { getStore } from '@netlify/blobs';
 
+declare const Netlify: {
+  env: {
+    get(name: string): string | undefined;
+  };
+};
+
 type Coin = 'btc' | 'eth' | 'sol' | 'xrp' | 'doge';
 type Side = 'buy' | 'sell';
 
@@ -74,14 +80,6 @@ type StoredState = {
   signals: Record<Coin, Signal>;
 };
 
-type HandlerEvent = {
-  httpMethod?: string;
-  path?: string;
-  rawUrl?: string;
-  headers?: Record<string, string | undefined>;
-  body?: string | null;
-};
-
 const COINS: Coin[] = ['btc', 'eth', 'sol', 'xrp', 'doge'];
 const STORE_NAME = 'paper-trader';
 const STATE_KEY = 'state';
@@ -129,13 +127,12 @@ const STRATEGY_META: Record<string, Pick<StrategyState, 'name' | 'blurb'>> = {
   },
 };
 
-const json = (statusCode: number, body: unknown) => ({
-  statusCode,
+const json = (status: number, body: unknown) => new Response(JSON.stringify(body), {
+  status,
   headers: {
     'content-type': 'application/json',
     'cache-control': 'no-store',
   },
-  body: JSON.stringify(body),
 });
 
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
@@ -163,7 +160,7 @@ function newState(now: number): StoredState {
     tickCount: 0,
     prices: Object.fromEntries(COINS.map((c) => [c, { bid: 0, ask: 0 }])) as Record<Coin, Price>,
     history: Object.fromEntries(COINS.map((c) => [c, []])) as Record<Coin, PricePoint[]>,
-    strategies: Object.fromEntries(Object.keys(STRATEGY_META).map((id) => [id, newStrategy(id)])) as Record<string, StrategyState>,
+    strategies: Object.fromEntries(Object.keys(STRATEGY_META).map((id) => [id, newStrategy(id)])),
     signals: {} as Record<Coin, Signal>,
   };
 }
@@ -507,39 +504,38 @@ function publicState(state: StoredState) {
   };
 }
 
-async function portfolio(event: HandlerEvent) {
-  const token = process.env.DASHBOARD_TOKEN;
-  const apiKey = process.env.COINSPOT_API_KEY;
-  const apiSecret = process.env.COINSPOT_API_SECRET;
+async function portfolio(req: Request) {
+  const token = Netlify.env.get('DASHBOARD_TOKEN');
+  const apiKey = Netlify.env.get('COINSPOT_API_KEY');
+  const apiSecret = Netlify.env.get('COINSPOT_API_SECRET');
   if (!apiKey || !apiSecret) return json(200, { configured: false, note: 'Read-only CoinSpot portfolio view is not configured.' });
-  if (token && event.headers?.['x-dashboard-token'] !== token) return json(401, { error: 'Dashboard token required.' });
+  if (token && req.headers.get('x-dashboard-token') !== token) return json(401, { error: 'Dashboard token required.' });
   return json(200, { configured: false, note: 'CoinSpot portfolio passthrough is disabled in this simulator function.' });
 }
 
-function routeFromEvent(event: HandlerEvent) {
-  const path = event.path ?? '';
+function routeFromRequest(req: Request) {
+  const path = new URL(req.url).pathname;
   if (path.includes('/portfolio')) return 'portfolio';
   if (path.includes('/tick')) return 'tick';
   return 'state';
 }
 
-function isScheduledEvent(event: HandlerEvent) {
-  const headers = event.headers ?? {};
-  return event.httpMethod === undefined
-    || headers['x-nf-event'] === 'schedule'
-    || headers['x-netlify-event'] === 'schedule'
-    || event.body === '{}';
+function isScheduledRequest(req: Request) {
+  return req.headers.get('x-nf-event') === 'schedule'
+    || req.headers.get('x-netlify-event') === 'schedule'
+    || req.headers.get('x-netlify-scheduled-function') === 'true';
 }
 
 export const config = {
+  path: ['/paper', '/paper/*'],
   schedule: '*/5 * * * *',
 };
 
-export const handler = async (event: HandlerEvent) => {
+export default async (req: Request) => {
   try {
-    const route = routeFromEvent(event);
-    if (route === 'portfolio') return portfolio(event);
-    if (route === 'tick' || isScheduledEvent(event)) {
+    const route = routeFromRequest(req);
+    if (route === 'portfolio') return portfolio(req);
+    if (route === 'tick' || isScheduledRequest(req) || req.method === 'POST') {
       const state = await runTick();
       return json(200, publicState(state));
     }
