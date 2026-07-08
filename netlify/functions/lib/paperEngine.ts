@@ -1,12 +1,10 @@
 /**
- * Paper Trading Engine v5 — CoinSpot public prices, simulated money only.
+ * Paper Trading Engine v6 — CoinSpot public prices, simulated money only.
  * No exchange keys exist anywhere in this system. Nothing here can place a real trade.
  *
- * v5: Adds guarded trading controls after PDF review showed active strategies
- * were overtrading, buying wide-spread coins, panic-stopping, and re-buying
- * shortly after stop-outs. Active strategies now require enough history,
- * acceptable spread, regime checks, drawdown protection, cooldowns, and
- * stronger confirmation before scalping.
+ * v6: Converts the scalper into an active micro-profit strategy. It aims to
+ * keep trading whenever there is any positive net value after fees/spread,
+ * while still preventing the old buy → panic sell → rebuy higher churn.
  */
 import { getStore } from '@netlify/blobs';
 
@@ -18,24 +16,26 @@ const FEE           = 0.001;
 export const START_CASH = 10000;
 const TICKS_PER_DAY = 288;
 const RECENT_CAP    = TICKS_PER_DAY * 8;
-const TRADES_CAP    = 600;
+const TRADES_CAP    = 1200;
 const EQUITY_CAP    = 2400;
 const DUST          = 5;
-const STATE_VERSION = 5;
+const STATE_VERSION = 6;
 
 const SC_ALLOC      = 80;
-const SC_TARGET     = 0.008;
-const SC_STOP       = 0.005;
-const SC_MAX_HOLD   = 12;
-const SC_MAX_OPEN   = 2;
+const SC_TARGET     = 0.0045;
+const SC_STOP       = 0.004;
+const SC_MAX_HOLD   = 6;
+const SC_MAX_OPEN   = 5;
+const SC_DAILY_TRADE_CAP = 250;
+const SC_MIN_NET_PROFIT_AUD = 0.02;
 
-const ACTIVE_MIN_HISTORY_TICKS = TICKS_PER_DAY;
-const MAX_ACTIVE_SPREAD_PCT    = 0.0075;
-const MAX_SCALP_SPREAD_PCT     = 0.003;
-const MIN_SCALP_NET_EDGE       = 0.004;
-const MIN_MOMENTUM_SCORE       = 0.02;
-const MAX_DAILY_DRAWDOWN       = 0.02;
-const MAX_TOTAL_DRAWDOWN       = 0.10;
+const ACTIVE_MIN_HISTORY_TICKS = 36;
+const MAX_ACTIVE_SPREAD_PCT    = 0.010;
+const MAX_SCALP_SPREAD_PCT     = 0.004;
+const MIN_SCALP_NET_EDGE       = 0.00025;
+const MIN_MOMENTUM_SCORE       = 0.003;
+const MAX_DAILY_DRAWDOWN       = 0.035;
+const MAX_TOTAL_DRAWDOWN       = 0.12;
 
 export interface Tick    { t: number; bid: number; ask: number }
 export interface Trade   { t: number; strategy: string; coin: Coin; side: 'buy'|'sell'; units: number; price: number; fee: number; cashAfter: number; reason: string }
@@ -64,10 +64,10 @@ export const STRATEGY_IDS = ['hold','dca','sma','momentum','meanrev','scalper'] 
 export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
   hold:     { name: 'Buy & Hold',     blurb: 'Benchmark. 50/50 BTC/ETH at first tick, never trades again.' },
   dca:      { name: 'Daily DCA',      blurb: 'Long book. Daily buy into top-ranked coins by composite score.' },
-  sma:      { name: 'SMA Crossover',  blurb: 'Guarded 1-hour vs 6-hour moving average crossover. Requires 24h history, acceptable spread, and supportive BTC/ETH regime.' },
-  momentum: { name: 'Momentum',       blurb: 'Guarded momentum book. Buys only mature positive scores; exits on thesis failure or protected stop.' },
+  sma:      { name: 'SMA Crossover',  blurb: 'Guarded 1-hour vs 6-hour moving average crossover. Requires usable history, acceptable spread, and supportive BTC/ETH regime.' },
+  momentum: { name: 'Momentum',       blurb: 'Guarded momentum book. Buys only positive scores; exits on thesis failure or protected stop.' },
   meanrev:  { name: 'Mean Reversion', blurb: 'Day book. Buys coins with strong negative 7d momentum for reversion; exits at +2% or 5% stop.' },
-  scalper:  { name: 'Scalper',        blurb: `Guarded micro day-trading. Burst signals are watchlist-only until spread, history, regime, cooldown and net-edge checks pass. $${SC_ALLOC} AUD per trade, exits at ${SC_TARGET*100}% profit, ${SC_STOP*100}% stop, or ${SC_MAX_HOLD} ticks.` },
+  scalper:  { name: 'Active Micro-Scalper', blurb: `High-activity micro day-trading. Targets 50-150 trades/day with a ${SC_DAILY_TRADE_CAP}/day safety cap. $${SC_ALLOC} AUD entries, exits as soon as net profit is positive after fees/spread, or at protected stop/time exit. Rebuy-higher after stops remains blocked unless the setup is materially stronger.` },
 };
 
 const store  = () => getStore('paper-trading');
@@ -198,6 +198,20 @@ function roundTripCostPct(tick: Tick): number {
   return spreadPct(tick) + FEE * 2;
 }
 
+function minScalpTakeProfitPct(tick: Tick, pos: Position): number {
+  const minCashPct = SC_MIN_NET_PROFIT_AUD / Math.max(DUST, pos.units * pos.entry);
+  return Math.max(SC_TARGET, roundTripCostPct(tick) + minCashPct);
+}
+
+function netPositionProfitAud(pos: Position, tick: Tick): number {
+  return pos.units * tick.bid * (1 - FEE) - pos.units * pos.entry;
+}
+
+function tradesToday(st: StratState, now: number): number {
+  const today = dayKey(now);
+  return st.trades.filter((tr) => dayKey(tr.t) === today).length;
+}
+
 function tickMomentum(recents: Record<Coin, Tick[]>, coin: Coin, lookback: number): number {
   const xs = recents[coin]?.map(mid) ?? [];
   if (xs.length < lookback + 1) return 0;
@@ -241,28 +255,28 @@ function recentStopCount(st: StratState, coin: Coin, now: number, seconds: numbe
 }
 
 function cooldownSeconds(reason: string): number {
-  if (/stop/i.test(reason)) return 2 * 60 * 60;
-  if (/target/i.test(reason)) return 30 * 60;
-  if (/time exit/i.test(reason)) return 60 * 60;
-  return 60 * 60;
+  if (/stop/i.test(reason)) return 20 * 60;
+  if (/target|micro profit/i.test(reason)) return 5 * 60;
+  if (/time exit/i.test(reason)) return 10 * 60;
+  return 10 * 60;
 }
 
 function blockedByCooldown(st: StratState, coin: Coin, tick: Tick, nextSetupScore: number): string | null {
   const last = lastSell(st, coin);
   if (!last) return null;
   const recentStops = recentStopCount(st, coin, tick.t, 24 * 60 * 60);
-  if (recentStops >= 3) return 'blocked: 3 stop-outs on same coin in 24h';
+  if (recentStops >= 5) return 'blocked: 5 stop-outs on same coin in 24h';
   const elapsed = tick.t - last.t;
-  const cooldown = recentStops >= 2 ? 4 * 60 * 60 : cooldownSeconds(last.reason);
+  const cooldown = recentStops >= 3 ? 30 * 60 : cooldownSeconds(last.reason);
   if (elapsed < cooldown) return `blocked: cooldown active after ${last.reason}`;
-  if (/stop/i.test(last.reason) && tick.ask > last.price && nextSetupScore < MIN_MOMENTUM_SCORE + 0.015) {
+  if (/stop/i.test(last.reason) && tick.ask > last.price && nextSetupScore < MIN_MOMENTUM_SCORE + 0.008) {
     return 'blocked: no re-buy higher after stop without stronger setup';
   }
   return null;
 }
 
 function activeEntryBlockReason(st: StratState, coin: Coin, tick: Tick, recents: Record<Coin, Tick[]>, regime: string, setupScore: number): string | null {
-  if (!hasMatureHistory(recents, coin)) return 'blocked: less than 24h history';
+  if (!hasMatureHistory(recents, coin)) return 'blocked: less than 3h history';
   const sp = spreadPct(tick);
   if (sp > MAX_ACTIVE_SPREAD_PCT) return `blocked: spread ${(sp * 100).toFixed(2)}% too wide`;
   if (regime === 'risk_off' && !['btc','eth'].includes(coin)) return 'blocked: BTC/ETH risk-off regime for altcoin';
@@ -302,7 +316,13 @@ function internalSignal(coin: Coin, recents: Record<Coin, Tick[]>, ticks: Ticks)
   const last6 = xs.slice(-6);
   let consec = 0, scalperSig: string | null = null;
   for (let i = 1; i < last6.length; i++) if (last6[i] > last6[i-1]) consec++; else consec = 0;
-  if (consec >= 3) scalperSig = 'burst ×3 consecutive up watchlist';
+  const m2 = xs.length >= 3 ? curr / xs[xs.length - 3] - 1 : 0;
+  const m3 = xs.length >= 4 ? curr / xs[xs.length - 4] - 1 : 0;
+  const wasDrop = xs.length >= 5 ? xs[xs.length - 2] / xs[xs.length - 5] - 1 < -0.003 : false;
+  const bounced = xs.length >= 2 ? curr > xs[xs.length - 2] : false;
+  if (consec >= 2 && m3 > 0) scalperSig = 'micro burst ×2 up';
+  else if (wasDrop && bounced) scalperSig = 'candle-drop fade bounce';
+  else if (m2 > 0.0015) scalperSig = 'micro momentum edge';
 
   const score = 0.35 * momentum1h + 0.30 * momentum24h + 0.20 * smaSignal + 0.15 * (zscore == null ? 0 : -Math.min(Math.max(zscore, -3), 3) / 3);
 
@@ -408,25 +428,35 @@ function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Ti
     for (const c of available) {
       const pos = sc.positions[c];
       if (!pos) continue;
-      const tick = ticks[c]!, pnlPct = tick.bid / pos.entry - 1;
+      const tick = ticks[c]!;
+      const pnlPct = tick.bid / pos.entry - 1;
       const age  = state.tickCount - (pos.entryTick ?? state.tickCount);
-      const gp   = pos.units * (tick.bid - pos.entry);
-      if (pnlPct >= SC_TARGET)    sellAll(sc, 'scalper', c, tick, `target +${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)}`);
-      else if (pnlPct <= -Math.max(SC_STOP, roundTripCostPct(tick) + 0.002)) sellAll(sc, 'scalper', c, tick, `protected stop ${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)}`);
-      else if (age >= SC_MAX_HOLD) sellAll(sc, 'scalper', c, tick, `time exit ${age}t (${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)})`);
+      const netProfit = netPositionProfitAud(pos, tick);
+      const takeProfitPct = minScalpTakeProfitPct(tick, pos);
+      if (netProfit >= SC_MIN_NET_PROFIT_AUD && pnlPct >= takeProfitPct) {
+        sellAll(sc, 'scalper', c, tick, `micro profit +${(pnlPct*100).toFixed(2)}% net≈$${netProfit.toFixed(2)}`);
+      } else if (pnlPct <= -Math.max(SC_STOP, roundTripCostPct(tick) + 0.0015)) {
+        sellAll(sc, 'scalper', c, tick, `protected stop ${(pnlPct*100).toFixed(2)}% net≈$${netProfit.toFixed(2)}`);
+      } else if (age >= SC_MAX_HOLD) {
+        sellAll(sc, 'scalper', c, tick, `time exit ${age}t (${(pnlPct*100).toFixed(2)}% net≈$${netProfit.toFixed(2)})`);
+      }
     }
-    if (Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC && regime !== 'risk_off') {
+
+    const todayTrades = tradesToday(sc, ticks.btc!.t);
+    if (todayTrades < SC_DAILY_TRADE_CAP && Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC && regime !== 'risk_off') {
       for (const c of available) {
-        if (sc.positions[c] || Object.keys(sc.positions).length >= SC_MAX_OPEN || sc.cash < SC_ALLOC) continue;
+        if (sc.positions[c] || Object.keys(sc.positions).length >= SC_MAX_OPEN || sc.cash < SC_ALLOC || tradesToday(sc, ticks.btc!.t) >= SC_DAILY_TRADE_CAP) continue;
         const tick = ticks[c]!;
         const sig = sigMap[c];
         const sp = spreadPct(tick);
-        const netEdge = SC_TARGET - roundTripCostPct(tick);
-        const block = activeEntryBlockReason(sc, c, tick, recents, regime, sig?.score ?? 0);
-        const strongBurst = Boolean(sig?.scalperSignal) && (sig?.momentum1h ?? 0) > 0 && (sig?.score ?? 0) > 0;
-        if (!block && sp <= MAX_SCALP_SPREAD_PCT && netEdge >= MIN_SCALP_NET_EDGE && strongBurst) {
+        const setupScore = Math.max(sig?.score ?? 0, tickMomentum(recents, c, 2) * 4, tickMomentum(recents, c, 3) * 3);
+        const plannedTarget = Math.max(SC_TARGET, roundTripCostPct(tick) + MIN_SCALP_NET_EDGE);
+        const netEdge = plannedTarget - roundTripCostPct(tick);
+        const block = activeEntryBlockReason(sc, c, tick, recents, regime, setupScore);
+        const activeSetup = Boolean(sig?.scalperSignal) && setupScore > MIN_MOMENTUM_SCORE;
+        if (!block && sp <= MAX_SCALP_SPREAD_PCT && netEdge >= MIN_SCALP_NET_EDGE && activeSetup) {
           buy(sc, 'scalper', c, tick, SC_ALLOC,
-              `guarded scalp: ${sig?.scalperSignal}; spread=${(sp*100).toFixed(2)}%; netEdge=${(netEdge*100).toFixed(2)}%; regime=${regime}`,
+              `active micro-scalp: ${sig?.scalperSignal}; spread=${(sp*100).toFixed(2)}%; plannedNetEdge=${(netEdge*100).toFixed(2)}%; regime=${regime}; dailyTrades=${todayTrades}/${SC_DAILY_TRADE_CAP}`,
               state.tickCount);
         }
       }
