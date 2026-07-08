@@ -1,11 +1,12 @@
 /**
- * Paper Trading Engine v4 — CoinSpot public prices, simulated money only.
+ * Paper Trading Engine v5 — CoinSpot public prices, simulated money only.
  * No exchange keys exist anywhere in this system. Nothing here can place a real trade.
  *
- * v4: Accepts enriched signals from Cloudflare Worker (1-min cron with CoinGecko
- * market data, volume, trend slope, Fear & Greed, trending status).
- * Falls back to internal signal computation when Cloudflare signals are absent.
- * All 10 CoinSpot coins traded based on composite multi-variable scores.
+ * v5: Adds guarded trading controls after PDF review showed active strategies
+ * were overtrading, buying wide-spread coins, panic-stopping, and re-buying
+ * shortly after stop-outs. Active strategies now require enough history,
+ * acceptable spread, regime checks, drawdown protection, cooldowns, and
+ * stronger confirmation before scalping.
  */
 import { getStore } from '@netlify/blobs';
 
@@ -20,13 +21,21 @@ const RECENT_CAP    = TICKS_PER_DAY * 8;
 const TRADES_CAP    = 600;
 const EQUITY_CAP    = 2400;
 const DUST          = 5;
-const STATE_VERSION = 4;
+const STATE_VERSION = 5;
 
-const SC_ALLOC    = 80;
-const SC_TARGET   = 0.008;
-const SC_STOP     = 0.005;
-const SC_MAX_HOLD = 12;
-const SC_MAX_OPEN = 5;
+const SC_ALLOC      = 80;
+const SC_TARGET     = 0.008;
+const SC_STOP       = 0.005;
+const SC_MAX_HOLD   = 12;
+const SC_MAX_OPEN   = 2;
+
+const ACTIVE_MIN_HISTORY_TICKS = TICKS_PER_DAY;
+const MAX_ACTIVE_SPREAD_PCT    = 0.0075;
+const MAX_SCALP_SPREAD_PCT     = 0.003;
+const MIN_SCALP_NET_EDGE       = 0.004;
+const MIN_MOMENTUM_SCORE       = 0.02;
+const MAX_DAILY_DRAWDOWN       = 0.02;
+const MAX_TOTAL_DRAWDOWN       = 0.10;
 
 export interface Tick    { t: number; bid: number; ask: number }
 export interface Trade   { t: number; strategy: string; coin: Coin; side: 'buy'|'sell'; units: number; price: number; fee: number; cashAfter: number; reason: string }
@@ -55,10 +64,10 @@ export const STRATEGY_IDS = ['hold','dca','sma','momentum','meanrev','scalper'] 
 export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
   hold:     { name: 'Buy & Hold',     blurb: 'Benchmark. 50/50 BTC/ETH at first tick, never trades again.' },
   dca:      { name: 'Daily DCA',      blurb: 'Long book. Daily buy into top-ranked coins by composite score.' },
-  sma:      { name: 'SMA Crossover',  blurb: 'Day book. 1-hour vs 6-hour moving average crossover on all coins.' },
-  momentum: { name: 'Momentum',       blurb: 'Day book. Buys top composite-score coins; exits on score reversal or 3% stop.' },
+  sma:      { name: 'SMA Crossover',  blurb: 'Guarded 1-hour vs 6-hour moving average crossover. Requires 24h history, acceptable spread, and supportive BTC/ETH regime.' },
+  momentum: { name: 'Momentum',       blurb: 'Guarded momentum book. Buys only mature positive scores; exits on thesis failure or protected stop.' },
   meanrev:  { name: 'Mean Reversion', blurb: 'Day book. Buys coins with strong negative 7d momentum for reversion; exits at +2% or 5% stop.' },
-  scalper:  { name: 'Scalper',        blurb: `Micro day-trading on 1-min data. Three pattern triggers: momentum burst, candle-drop fade, RSI oversold. $${SC_ALLOC} AUD per trade, exits at ${SC_TARGET*100}% profit, ${SC_STOP*100}% stop, or ${SC_MAX_HOLD} ticks.` },
+  scalper:  { name: 'Scalper',        blurb: `Guarded micro day-trading. Burst signals are watchlist-only until spread, history, regime, cooldown and net-edge checks pass. $${SC_ALLOC} AUD per trade, exits at ${SC_TARGET*100}% profit, ${SC_STOP*100}% stop, or ${SC_MAX_HOLD} ticks.` },
 };
 
 const store  = () => getStore('paper-trading');
@@ -177,6 +186,92 @@ const smaOf = (xs: number[], n: number): number | null => {
   return s / n;
 };
 
+function spreadPct(tick: Tick): number {
+  return (tick.ask - tick.bid) / tick.bid;
+}
+
+function hasMatureHistory(recents: Record<Coin, Tick[]>, coin: Coin): boolean {
+  return (recents[coin]?.length ?? 0) >= ACTIVE_MIN_HISTORY_TICKS;
+}
+
+function roundTripCostPct(tick: Tick): number {
+  return spreadPct(tick) + FEE * 2;
+}
+
+function tickMomentum(recents: Record<Coin, Tick[]>, coin: Coin, lookback: number): number {
+  const xs = recents[coin]?.map(mid) ?? [];
+  if (xs.length < lookback + 1) return 0;
+  return xs[xs.length - 1] / xs[xs.length - 1 - lookback] - 1;
+}
+
+function marketRegime(recents: Record<Coin, Tick[]>, ticks: Ticks): 'supportive' | 'neutral' | 'risk_off' {
+  const btcXs = recents.btc?.map(mid) ?? [];
+  const ethXs = recents.eth?.map(mid) ?? [];
+  if (btcXs.length < 72 || ethXs.length < 72 || !ticks.btc || !ticks.eth) return 'neutral';
+  const btcSlow = smaOf(btcXs, 72);
+  const ethSlow = smaOf(ethXs, 72);
+  const btcM1h = tickMomentum(recents, 'btc', 12);
+  const ethM1h = tickMomentum(recents, 'eth', 12);
+  const btcBear = btcSlow != null && mid(ticks.btc) < btcSlow && btcM1h < 0;
+  const ethBear = ethSlow != null && mid(ticks.eth) < ethSlow && ethM1h < 0;
+  if (btcBear && ethBear) return 'risk_off';
+  if (!btcBear && !ethBear && btcM1h >= 0 && ethM1h >= 0) return 'supportive';
+  return 'neutral';
+}
+
+function strategyDrawdownBlocked(st: StratState, ticks: Ticks): boolean {
+  const eq = equityOf(st, ticks);
+  if (eq <= st.startCash * (1 - MAX_TOTAL_DRAWDOWN)) return true;
+  const today = dayKey(ticks.btc?.t ?? Math.floor(Date.now() / 1000));
+  const firstToday = st.equity.find(([t]) => dayKey(t) === today)?.[1];
+  if (firstToday && eq <= firstToday * (1 - MAX_DAILY_DRAWDOWN)) return true;
+  return false;
+}
+
+function lastSell(st: StratState, coin: Coin): Trade | null {
+  for (let i = st.trades.length - 1; i >= 0; i--) {
+    const tr = st.trades[i];
+    if (tr.coin === coin && tr.side === 'sell') return tr;
+  }
+  return null;
+}
+
+function recentStopCount(st: StratState, coin: Coin, now: number, seconds: number): number {
+  return st.trades.filter((tr) => tr.coin === coin && tr.side === 'sell' && now - tr.t <= seconds && /stop/i.test(tr.reason)).length;
+}
+
+function cooldownSeconds(reason: string): number {
+  if (/stop/i.test(reason)) return 2 * 60 * 60;
+  if (/target/i.test(reason)) return 30 * 60;
+  if (/time exit/i.test(reason)) return 60 * 60;
+  return 60 * 60;
+}
+
+function blockedByCooldown(st: StratState, coin: Coin, tick: Tick, nextSetupScore: number): string | null {
+  const last = lastSell(st, coin);
+  if (!last) return null;
+  const recentStops = recentStopCount(st, coin, tick.t, 24 * 60 * 60);
+  if (recentStops >= 3) return 'blocked: 3 stop-outs on same coin in 24h';
+  const elapsed = tick.t - last.t;
+  const cooldown = recentStops >= 2 ? 4 * 60 * 60 : cooldownSeconds(last.reason);
+  if (elapsed < cooldown) return `blocked: cooldown active after ${last.reason}`;
+  if (/stop/i.test(last.reason) && tick.ask > last.price && nextSetupScore < MIN_MOMENTUM_SCORE + 0.015) {
+    return 'blocked: no re-buy higher after stop without stronger setup';
+  }
+  return null;
+}
+
+function activeEntryBlockReason(st: StratState, coin: Coin, tick: Tick, recents: Record<Coin, Tick[]>, regime: string, setupScore: number): string | null {
+  if (!hasMatureHistory(recents, coin)) return 'blocked: less than 24h history';
+  const sp = spreadPct(tick);
+  if (sp > MAX_ACTIVE_SPREAD_PCT) return `blocked: spread ${(sp * 100).toFixed(2)}% too wide`;
+  if (regime === 'risk_off' && !['btc','eth'].includes(coin)) return 'blocked: BTC/ETH risk-off regime for altcoin';
+  if (strategyDrawdownBlocked(st, { ...Object.fromEntries(COINS.map((c) => [c, tick])), btc: tick } as Ticks)) return 'blocked: strategy drawdown protection active';
+  const cd = blockedByCooldown(st, coin, tick, setupScore);
+  if (cd) return cd;
+  return null;
+}
+
 function internalSignal(coin: Coin, recents: Record<Coin, Tick[]>, ticks: Ticks): CoinSignal | null {
   if (!ticks[coin]) return null;
   const xs   = recents[coin].map(mid);
@@ -207,7 +302,7 @@ function internalSignal(coin: Coin, recents: Record<Coin, Tick[]>, ticks: Ticks)
   const last6 = xs.slice(-6);
   let consec = 0, scalperSig: string | null = null;
   for (let i = 1; i < last6.length; i++) if (last6[i] > last6[i-1]) consec++; else consec = 0;
-  if (consec >= 3) scalperSig = 'burst ×3 consecutive up';
+  if (consec >= 3) scalperSig = 'burst ×3 consecutive up watchlist';
 
   const score = 0.35 * momentum1h + 0.30 * momentum24h + 0.20 * smaSignal + 0.15 * (zscore == null ? 0 : -Math.min(Math.max(zscore, -3), 3) / 3);
 
@@ -217,6 +312,7 @@ function internalSignal(coin: Coin, recents: Record<Coin, Tick[]>, ticks: Ticks)
 function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Tick[]>, externalSignals: CoinSignal[] | null) {
   const S         = state.strategies;
   const available = COINS.filter((c) => ticks[c]);
+  const regime    = marketRegime(recents, ticks);
 
   const sigMap: Record<string, CoinSignal> = {};
   if (externalSignals?.length) for (const s of externalSignals) sigMap[s.coin] = s;
@@ -243,66 +339,97 @@ function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Ti
   }
 
   const smaSt = S.sma;
-  for (const c of available) {
-    const xs = recents[c].map(mid);
-    const fast = smaOf(xs, 12), slow = smaOf(xs, 72);
-    const fp   = xs.length > 1 ? smaOf(xs.slice(0,-1), 12) : null;
-    const sp   = xs.length > 1 ? smaOf(xs.slice(0,-1), 72) : null;
-    if (fast == null || slow == null || fp == null || sp == null) continue;
-    const inPos = Boolean(smaSt.positions[c]);
-    const nOpen = Object.keys(smaSt.positions).length;
-    if (!inPos && fp <= sp && fast > slow && nOpen < 4)
-      buy(smaSt, 'sma', c, ticks[c]!, smaSt.cash / Math.max(1, 4 - nOpen), `golden cross ${c.toUpperCase()}`);
-    else if (inPos && fp >= sp && fast < slow)
-      sellAll(smaSt, 'sma', c, ticks[c]!, `death cross ${c.toUpperCase()}`);
+  if (!strategyDrawdownBlocked(smaSt, ticks)) {
+    for (const c of available) {
+      const xs = recents[c].map(mid);
+      const fast = smaOf(xs, 12), slow = smaOf(xs, 72);
+      const fp   = xs.length > 1 ? smaOf(xs.slice(0,-1), 12) : null;
+      const sp   = xs.length > 1 ? smaOf(xs.slice(0,-1), 72) : null;
+      if (fast == null || slow == null || fp == null || sp == null) continue;
+      const inPos = Boolean(smaSt.positions[c]);
+      const nOpen = Object.keys(smaSt.positions).length;
+      const tick = ticks[c]!;
+      const score = sigMap[c]?.score ?? 0;
+      const block = activeEntryBlockReason(smaSt, c, tick, recents, regime, score);
+      if (!inPos && !block && fp <= sp && fast > slow && tickMomentum(recents, c, 12) > 0 && nOpen < 3) {
+        const spend = Math.min(smaSt.cash / Math.max(1, 3 - nOpen), smaSt.startCash * 0.10);
+        buy(smaSt, 'sma', c, tick, spend, `guarded golden cross ${c.toUpperCase()} score=${score.toFixed(3)} regime=${regime}`);
+      } else if (inPos && fp >= sp && fast < slow) {
+        sellAll(smaSt, 'sma', c, tick, `death cross ${c.toUpperCase()} thesis invalidated`);
+      }
+    }
   }
 
   const mom    = S.momentum;
   const topMom = new Set(ranked.slice(0, 3));
-  for (const c of available) {
-    const pos = mom.positions[c], sig = sigMap[c];
-    const nOpen = Object.keys(mom.positions).length;
-    if (!pos && topMom.has(c) && (sig?.score ?? 0) > 0.01 && nOpen < 3)
-      buy(mom, 'momentum', c, ticks[c]!, mom.cash / Math.max(1, 3 - nOpen),
-          `top-3 score=${(sig?.score ?? 0).toFixed(3)} m1h=${((sig?.momentum1h ?? 0)*100).toFixed(2)}%`);
-    else if (pos) {
-      const dd = ticks[c]!.bid / pos.entry - 1;
-      if ((sig?.score ?? 0) < -0.02) sellAll(mom, 'momentum', c, ticks[c]!, `score negative ${(sig?.score ?? 0).toFixed(3)}`);
-      else if (dd < -0.03) sellAll(mom, 'momentum', c, ticks[c]!, 'stop loss -3%');
+  if (!strategyDrawdownBlocked(mom, ticks)) {
+    for (const c of available) {
+      const pos = mom.positions[c], sig = sigMap[c];
+      const nOpen = Object.keys(mom.positions).length;
+      const tick = ticks[c]!;
+      const score = sig?.score ?? 0;
+      const block = activeEntryBlockReason(mom, c, tick, recents, regime, score);
+      if (!pos && !block && topMom.has(c) && score > MIN_MOMENTUM_SCORE && tickMomentum(recents, c, 12) > 0 && nOpen < 3) {
+        const spend = Math.min(mom.cash / Math.max(1, 3 - nOpen), mom.startCash * 0.10);
+        buy(mom, 'momentum', c, tick, spend,
+            `guarded momentum score=${score.toFixed(3)} m1h=${((sig?.momentum1h ?? 0)*100).toFixed(2)}% regime=${regime}`);
+      } else if (pos) {
+        const dd = tick.bid / pos.entry - 1;
+        const protectedStop = -(Math.max(0.03, roundTripCostPct(tick) + 0.01));
+        if (score < -0.02) sellAll(mom, 'momentum', c, tick, `score negative ${score.toFixed(3)} thesis invalidated`);
+        else if (dd < protectedStop) sellAll(mom, 'momentum', c, tick, `protected stop ${(dd*100).toFixed(2)}% incl spread/fees`);
+      }
     }
   }
 
   const mr      = S.meanrev;
   const bottom3 = ranked.slice(-3).filter((c) => (sigMap[c]?.momentum7d ?? 0) < -0.05);
-  for (const c of available) {
-    const pos = mr.positions[c], sig = sigMap[c];
-    const nOpen = Object.keys(mr.positions).length;
-    if (!pos && bottom3.includes(c) && nOpen < 3)
-      buy(mr, 'meanrev', c, ticks[c]!, mr.cash / Math.max(1, 3 - nOpen),
-          `mean-rev 7d=${((sig?.momentum7d ?? 0)*100).toFixed(1)}% oversold`);
-    else if (pos) {
-      const dd = ticks[c]!.bid / pos.entry - 1;
-      if (dd > 0.02)       sellAll(mr, 'meanrev', c, ticks[c]!, 'reversion +2% hit');
-      else if (dd < -0.05) sellAll(mr, 'meanrev', c, ticks[c]!, 'stop -5%');
+  if (!strategyDrawdownBlocked(mr, ticks)) {
+    for (const c of available) {
+      const pos = mr.positions[c], sig = sigMap[c];
+      const nOpen = Object.keys(mr.positions).length;
+      const tick = ticks[c]!;
+      const score = sig?.score ?? 0;
+      const block = activeEntryBlockReason(mr, c, tick, recents, regime, score);
+      if (!pos && !block && bottom3.includes(c) && nOpen < 3) {
+        const spend = Math.min(mr.cash / Math.max(1, 3 - nOpen), mr.startCash * 0.10);
+        buy(mr, 'meanrev', c, tick, spend,
+            `guarded mean-rev 7d=${((sig?.momentum7d ?? 0)*100).toFixed(1)}% oversold regime=${regime}`);
+      } else if (pos) {
+        const dd = tick.bid / pos.entry - 1;
+        if (dd > 0.02)       sellAll(mr, 'meanrev', c, tick, 'reversion +2% hit');
+        else if (dd < -0.05) sellAll(mr, 'meanrev', c, tick, 'protected stop -5%');
+      }
     }
   }
 
   const sc = S.scalper;
-  for (const c of available) {
-    const pos = sc.positions[c];
-    if (!pos) continue;
-    const tick = ticks[c]!, pnlPct = tick.bid / pos.entry - 1;
-    const age  = state.tickCount - (pos.entryTick ?? state.tickCount);
-    const gp   = pos.units * (tick.bid - pos.entry);
-    if (pnlPct >= SC_TARGET)    sellAll(sc, 'scalper', c, tick, `target +${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)}`);
-    else if (pnlPct <= -SC_STOP) sellAll(sc, 'scalper', c, tick, `stop −${(Math.abs(pnlPct)*100).toFixed(2)}% ≈ $${gp.toFixed(2)}`);
-    else if (age >= SC_MAX_HOLD) sellAll(sc, 'scalper', c, tick, `time exit ${age}t (${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)})`);
-  }
-  if (Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC) {
+  if (!strategyDrawdownBlocked(sc, ticks)) {
     for (const c of available) {
-      if (sc.positions[c] || Object.keys(sc.positions).length >= SC_MAX_OPEN || sc.cash < SC_ALLOC) continue;
-      const sig = sigMap[c]?.scalperSignal;
-      if (sig) buy(sc, 'scalper', c, ticks[c]!, SC_ALLOC, `scalp: ${sig}`, state.tickCount);
+      const pos = sc.positions[c];
+      if (!pos) continue;
+      const tick = ticks[c]!, pnlPct = tick.bid / pos.entry - 1;
+      const age  = state.tickCount - (pos.entryTick ?? state.tickCount);
+      const gp   = pos.units * (tick.bid - pos.entry);
+      if (pnlPct >= SC_TARGET)    sellAll(sc, 'scalper', c, tick, `target +${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)}`);
+      else if (pnlPct <= -Math.max(SC_STOP, roundTripCostPct(tick) + 0.002)) sellAll(sc, 'scalper', c, tick, `protected stop ${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)}`);
+      else if (age >= SC_MAX_HOLD) sellAll(sc, 'scalper', c, tick, `time exit ${age}t (${(pnlPct*100).toFixed(2)}% ≈ $${gp.toFixed(2)})`);
+    }
+    if (Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC && regime !== 'risk_off') {
+      for (const c of available) {
+        if (sc.positions[c] || Object.keys(sc.positions).length >= SC_MAX_OPEN || sc.cash < SC_ALLOC) continue;
+        const tick = ticks[c]!;
+        const sig = sigMap[c];
+        const sp = spreadPct(tick);
+        const netEdge = SC_TARGET - roundTripCostPct(tick);
+        const block = activeEntryBlockReason(sc, c, tick, recents, regime, sig?.score ?? 0);
+        const strongBurst = Boolean(sig?.scalperSignal) && (sig?.momentum1h ?? 0) > 0 && (sig?.score ?? 0) > 0;
+        if (!block && sp <= MAX_SCALP_SPREAD_PCT && netEdge >= MIN_SCALP_NET_EDGE && strongBurst) {
+          buy(sc, 'scalper', c, tick, SC_ALLOC,
+              `guarded scalp: ${sig?.scalperSignal}; spread=${(sp*100).toFixed(2)}%; netEdge=${(netEdge*100).toFixed(2)}%; regime=${regime}`,
+              state.tickCount);
+        }
+      }
     }
   }
 
@@ -344,14 +471,20 @@ export async function currentSignals(ticks: Ticks): Promise<CoinSignal[]> {
 
 export function summarise(state: PaperState, ticks: Ticks) {
   const out: Record<string, unknown> = {};
+  const holdEq = state.strategies.hold ? equityOf(state.strategies.hold, ticks) : 0;
+  const holdReturnPct = state.strategies.hold && state.strategies.hold.startCash > 0
+    ? (holdEq / state.strategies.hold.startCash - 1) * 100
+    : 0;
   for (const id of STRATEGY_IDS) {
     const st = state.strategies[id]; if (!st) continue;
     const eq = equityOf(st, ticks);
+    const returnPct = (eq / st.startCash - 1) * 100;
     out[id] = {
       ...STRATEGY_META[id],
       cash: Number(st.cash.toFixed(2)), startCash: Number(st.startCash.toFixed(2)),
       equity: Number(eq.toFixed(2)),
-      returnPct: Number(((eq / st.startCash - 1) * 100).toFixed(2)),
+      returnPct: Number(returnPct.toFixed(2)),
+      benchmarkStatus: id === 'hold' ? 'benchmark' : (returnPct >= holdReturnPct ? 'beating passive benchmark' : 'underperforming passive benchmark'),
       realisedPnl: Number(st.realisedPnl.toFixed(2)),
       wins: st.wins, losses: st.losses,
       openPositions: Object.fromEntries(
