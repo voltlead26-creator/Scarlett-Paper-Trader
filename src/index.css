@@ -21,6 +21,8 @@ h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.02em; color: var(--sca
 .banner p { margin: 0; font-size: 14px; }
 button { background: var(--scarlet); color: var(--paper); border: 0; border-radius: 8px; padding: 9px 16px; font-family: inherit; font-weight: 600; font-size: 13px; cursor: pointer; }
 button:disabled { opacity: 0.6; cursor: default; }
+button.ghost { background: #fff8ec; color: var(--scarlet); border: 1px solid rgba(200,68,43,0.32); }
+button.ghost:not(:disabled):hover { background: rgba(200,68,43,0.08); }
 
 .prices { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
 .price { display: flex; gap: 10px; align-items: baseline; background: #fff; border: 1px solid rgba(43,37,33,0.12); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
@@ -29,6 +31,9 @@ button:disabled { opacity: 0.6; cursor: default; }
 
 .card { background: #fff; border: 1px solid rgba(43,37,33,0.12); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
 .card h2 { margin: 0 0 12px; font-size: 16px; }
+.card-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 12px; }
+.card-head h2 { margin-bottom: 4px; }
+.trade-count { margin: 0; font-size: 12.5px; }
 .chart { width: 100%; height: auto; }
 .chart-empty { font-size: 13px; opacity: 0.6; padding: 30px 0; text-align: center; }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; margin-top: 8px; }
@@ -45,8 +50,17 @@ button:disabled { opacity: 0.6; cursor: default; }
 .down { color: var(--scarlet); }
 .positions { margin-top: 10px; font-size: 12px; display: flex; flex-direction: column; gap: 3px; opacity: 0.85; }
 
+.table-wrap { max-height: 620px; overflow: auto; border: 1px solid rgba(43,37,33,0.09); border-radius: 10px; }
+.table-wrap table { min-width: 900px; }
+.table-wrap thead th { position: sticky; top: 0; z-index: 1; background: #fff8ec; }
+
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.55; padding: 6px 8px; border-bottom: 1px solid rgba(43,37,33,0.15); }
-td { padding: 7px 8px; border-bottom: 1px solid rgba(43,37,33,0.07); }
+td { padding: 7px 8px; border-bottom: 1px solid rgba(43,37,33,0.07); vertical-align: top; }
 
 footer { font-size: 12px; opacity: 0.6; line-height: 1.5; margin-top: 8px; }
+
+@media (max-width: 720px) {
+  header, .card-head { flex-direction: column; }
+  .card-head button { width: 100%; }
+}
