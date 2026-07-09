@@ -1,5 +1,5 @@
-// Paper-trading read API + manual controls. Simulated money only — no exchange keys exist.
-import { COINS, CoinSignal, currentSignals, fetchPrices, loadDay, loadRecent, loadState, runTick, summarise, type Coin } from './lib/paperEngine';
+// Paper-trading read API + manual controls. Simulated money only - no exchange keys exist.
+import { CoinSignal, currentSignals, fetchPrices, loadDay, loadRecent, loadState, runTick, summarise, type Coin } from './lib/paperEngine';
 import { coinspotConfigured, myBalances } from './lib/coinspot';
 
 function json(body: unknown, status = 200) {
@@ -7,6 +7,11 @@ function json(body: unknown, status = 200) {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
   });
+}
+
+function normaliseCoin(value: string | null): Coin | null {
+  const coin = (value || 'btc').trim().toLowerCase();
+  return /^[a-z0-9]+$/.test(coin) ? coin : null;
 }
 
 export default async function handler(request: Request) {
@@ -27,8 +32,8 @@ export default async function handler(request: Request) {
   }
 
   if (request.method === 'GET' && route === '/paper/history') {
-    const coin = (url.searchParams.get('coin') || 'btc') as Coin;
-    if (!COINS.includes(coin)) return json({ error: `coin must be one of ${COINS.join(', ')}` }, 400);
+    const coin = normaliseCoin(url.searchParams.get('coin'));
+    if (!coin) return json({ error: 'coin must be an alphanumeric CoinSpot symbol, for example btc, eth, sol, zec, or pendle' }, 400);
     const day  = url.searchParams.get('day');
     const data = day ? await loadDay(coin, day) : await loadRecent(coin);
     return json({ coin, day: day ?? 'recent-8-days', ticks: data });
@@ -37,7 +42,7 @@ export default async function handler(request: Request) {
   if (request.method === 'GET' && route === '/paper/portfolio') {
     if (!coinspotConfigured()) return json({ configured: false, note: 'Add COINSPOT_API_KEY and COINSPOT_API_SECRET in Netlify env vars, then redeploy.' });
     const gate     = process.env.DASHBOARD_TOKEN;
-    if (!gate) return json({ configured: true, error: 'DASHBOARD_TOKEN not set — refusing to expose balances on a public URL.' }, 403);
+    if (!gate) return json({ configured: true, error: 'DASHBOARD_TOKEN not set - refusing to expose balances on a public URL.' }, 403);
     const supplied = request.headers.get('x-dashboard-token') ?? url.searchParams.get('token') ?? '';
     if (supplied !== gate) return json({ configured: true, error: 'Invalid or missing dashboard token.' }, 401);
     const result = await myBalances();
@@ -50,7 +55,7 @@ export default async function handler(request: Request) {
     try {
       const body = await request.json() as { signals?: CoinSignal[] };
       if (Array.isArray(body?.signals) && body.signals.length > 0) externalSignals = body.signals;
-    } catch { /* manual trigger with no body — fine */ }
+    } catch { /* manual trigger with no body - fine */ }
     const result = await runTick(externalSignals);
     return json(result, result.ok ? 200 : 429);
   }
