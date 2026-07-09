@@ -8,7 +8,11 @@
  */
 import { getStore } from '@netlify/blobs';
 
-export const COINS = ['btc','eth','sol','xrp','doge','ada','ltc','trx','eos','powr'] as const;
+export const COINS = [
+  'btc','eth','sol','xrp','doge','ada','ltc','trx','eos','powr',
+  'bnb','link','avax','dot','matic','shib','pepe','xlm','hbar','near',
+  'atom','uni','aave','sand','mana','inj','arb','op'
+] as const;
 export type Coin = (typeof COINS)[number];
 export type Ticks = Partial<Record<Coin, Tick>>;
 
@@ -37,6 +41,7 @@ const MOM_MAX_OPEN       = 4;
 const MOM_TAKE_PROFIT    = 0.014;
 const MOM_STOP_EXTRA     = 0.010;
 const MOM_MIN_SCORE      = 0.002;
+const ALT_RISK_OFF_SCORE = MOM_MIN_SCORE + 0.012;
 
 const MR_MAX_OPEN        = 4;
 const MR_TAKE_PROFIT     = 0.012;
@@ -88,12 +93,13 @@ export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
   sma:      { name: 'Fast SMA Profit Lock', blurb: '1-hour vs 6-hour crossover strategy with spread-aware entries, quick profit lock, death-cross exit, and protected stops.' },
   momentum: { name: 'Momentum Profit Harvester', blurb: 'Buys the strongest short-term movers, takes small wins quickly, and exits when momentum fades instead of waiting for a large reversal.' },
   meanrev:  { name: 'Mean Reversion Bounce', blurb: 'Buys oversold bounce setups only after a rebound begins, then exits at a small profit, time limit, or tight protected stop.' },
-  scalper:  { name: 'Active Micro-Scalper', blurb: `High-activity micro day-trading. Targets 50-150 trades/day with a ${SC_DAILY_TRADE_CAP}/day safety cap. $${SC_ALLOC} AUD entries, exits as soon as net profit is positive after fees/spread, or at protected stop/time exit. Rebuy-higher after stops remains blocked unless the setup is materially stronger.` },
+  scalper:  { name: 'Active Micro-Scalper', blurb: `High-activity micro day-trading across BTC, ETH, and supported altcoins. Targets 50-150 trades/day with a ${SC_DAILY_TRADE_CAP}/day safety cap. $${SC_ALLOC} AUD entries, exits as soon as net profit is positive after fees/spread, or at protected stop/time exit. Rebuy-higher after stops remains blocked unless the setup is materially stronger.` },
 };
 
 const store  = () => getStore('paper-trading');
 const dayKey = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
 const mid    = (k: Tick)   => (k.bid + k.ask) / 2;
+const isMajor = (coin: Coin) => coin === 'btc' || coin === 'eth';
 
 export async function fetchPrices(): Promise<Ticks | null> {
   try {
@@ -300,7 +306,7 @@ function activeEntryBlockReason(st: StratState, coin: Coin, tick: Tick, recents:
   if (!hasMatureHistory(recents, coin)) return 'blocked: less than 3h history';
   const sp = spreadPct(tick);
   if (sp > MAX_ACTIVE_SPREAD_PCT) return `blocked: spread ${(sp * 100).toFixed(2)}% too wide`;
-  if (regime === 'risk_off' && !['btc','eth'].includes(coin)) return 'blocked: BTC/ETH risk-off regime for altcoin';
+  if (regime === 'risk_off' && !isMajor(coin) && setupScore < ALT_RISK_OFF_SCORE) return `blocked: altcoin risk-off setup too weak (${setupScore.toFixed(3)})`;
   if (strategyDrawdownBlocked(st, ticks)) return 'blocked: strategy drawdown protection active';
   const cd = blockedByCooldown(st, coin, tick, setupScore);
   if (cd) return cd;
@@ -487,7 +493,7 @@ function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Ti
     }
 
     const todayTrades = tradesToday(sc, ticks.btc!.t);
-    if (todayTrades < SC_DAILY_TRADE_CAP && Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC && regime !== 'risk_off') {
+    if (todayTrades < SC_DAILY_TRADE_CAP && Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC) {
       for (const c of available) {
         if (sc.positions[c] || Object.keys(sc.positions).length >= SC_MAX_OPEN || sc.cash < SC_ALLOC || tradesToday(sc, ticks.btc!.t) >= SC_DAILY_TRADE_CAP) continue;
         const tick = ticks[c]!;
