@@ -11,7 +11,8 @@ import { getStore } from '@netlify/blobs';
 export const COINS = [
   'btc','eth','sol','xrp','doge','ada','ltc','trx','eos','powr',
   'bnb','link','avax','dot','matic','shib','pepe','xlm','hbar','near',
-  'atom','uni','aave','sand','mana','inj','arb','op'
+  'atom','uni','aave','sand','mana','inj','arb','op','zec','ena',
+  'pendle','hype','dash','epic','render','rndr'
 ] as const;
 export type Coin = (typeof COINS)[number];
 export type Ticks = Partial<Record<Coin, Tick>>;
