@@ -1,22 +1,17 @@
 /**
- * Paper Trading Engine v7 - CoinSpot public prices, simulated money only.
+ * Paper Trading Engine v8 - CoinSpot public prices, simulated money only.
  * No exchange keys exist anywhere in this system. Nothing here can place a real trade.
  *
- * v7: Upgrades every active strategy, not just the scalper. The engine now
- * favours quicker profit capture, smaller controlled losses, spread/fee-aware
- * entries, anti-churn cooldowns, and a cleaner full-history audit trail.
+ * v8: Removes the fixed coin whitelist. Every valid market returned by
+ * CoinSpot's public latest-prices endpoint is tracked, ranked, and eligible for
+ * simulated strategies, while BTC/ETH remain required for market-regime checks.
  */
 import { getStore } from '@netlify/blobs';
 
-export const COINS = [
-  'btc','eth','sol','xrp','doge','ada','ltc','trx','eos','powr',
-  'bnb','link','avax','dot','matic','shib','pepe','xlm','hbar','near',
-  'atom','uni','aave','sand','mana','inj','arb','op','zec','ena',
-  'pendle','hype','dash','epic','render','rndr'
-] as const;
-export type Coin = (typeof COINS)[number];
+export type Coin = string;
 export type Ticks = Partial<Record<Coin, Tick>>;
 
+const REQUIRED_MARKETS = ['btc','eth'] as const;
 const FEE           = 0.001;
 export const START_CASH = 10000;
 const TICKS_PER_DAY = 288;
@@ -24,7 +19,7 @@ const RECENT_CAP    = TICKS_PER_DAY * 8;
 const TRADES_CAP    = 1200;
 const EQUITY_CAP    = 2400;
 const DUST          = 5;
-const STATE_VERSION = 7;
+const STATE_VERSION = 8;
 
 const DCA_INTERVAL_TICKS = 48;
 const DCA_ALLOC          = 35;
@@ -90,17 +85,18 @@ export const STRATEGY_IDS = ['hold','dca','sma','momentum','meanrev','scalper'] 
 
 export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
   hold:     { name: 'Buy & Hold', blurb: 'Benchmark. 50/50 BTC/ETH at first tick, never trades again.' },
-  dca:      { name: 'Active DCA Rebalancer', blurb: `Every ${DCA_INTERVAL_TICKS} ticks (~4h), adds small buys into the strongest coins and trims positions on quick profit, thesis failure, or protected stop.` },
+  dca:      { name: 'Active DCA Rebalancer', blurb: `Every ${DCA_INTERVAL_TICKS} ticks (~4h), adds small buys into the strongest CoinSpot markets and trims positions on quick profit, thesis failure, or protected stop.` },
   sma:      { name: 'Fast SMA Profit Lock', blurb: '1-hour vs 6-hour crossover strategy with spread-aware entries, quick profit lock, death-cross exit, and protected stops.' },
   momentum: { name: 'Momentum Profit Harvester', blurb: 'Buys the strongest short-term movers, takes small wins quickly, and exits when momentum fades instead of waiting for a large reversal.' },
   meanrev:  { name: 'Mean Reversion Bounce', blurb: 'Buys oversold bounce setups only after a rebound begins, then exits at a small profit, time limit, or tight protected stop.' },
-  scalper:  { name: 'Active Micro-Scalper', blurb: `High-activity micro day-trading across BTC, ETH, and supported altcoins. Targets 50-150 trades/day with a ${SC_DAILY_TRADE_CAP}/day safety cap. $${SC_ALLOC} AUD entries, exits as soon as net profit is positive after fees/spread, or at protected stop/time exit. Rebuy-higher after stops remains blocked unless the setup is materially stronger.` },
+  scalper:  { name: 'Active Micro-Scalper', blurb: `High-activity micro day-trading across every CoinSpot market with a valid public bid/ask. Targets 50-150 trades/day with a ${SC_DAILY_TRADE_CAP}/day safety cap. $${SC_ALLOC} AUD entries, exits as soon as net profit is positive after fees/spread, or at protected stop/time exit. Rebuy-higher after stops remains blocked unless the setup is materially stronger.` },
 };
 
 const store  = () => getStore('paper-trading');
 const dayKey = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
 const mid    = (k: Tick)   => (k.bid + k.ask) / 2;
 const isMajor = (coin: Coin) => coin === 'btc' || coin === 'eth';
+const tickCoins = (ticks: Ticks): Coin[] => Object.keys(ticks).filter((c) => Boolean(ticks[c]));
 
 export async function fetchPrices(): Promise<Ticks | null> {
   try {
@@ -110,16 +106,12 @@ export async function fetchPrices(): Promise<Ticks | null> {
     if (json.status !== 'ok') return null;
     const t = Math.floor(Date.now() / 1000);
     const out: Ticks = {};
-    const s = store();
-    for (const c of COINS) {
-      const p   = json.prices[c];
-      const bid = p ? Number(p.bid) : NaN;
-      const ask = p ? Number(p.ask) : NaN;
-      if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
-        out[c] = { t, bid, ask };
-      } else {
-        const recent = await s.get(`recent:${c}`, { type: 'json' }) as Tick[] | null;
-        if (recent?.length) out[c] = { ...recent[recent.length - 1], t };
+    for (const [rawCoin, p] of Object.entries(json.prices)) {
+      const coin = rawCoin.toLowerCase();
+      const bid = Number(p?.bid);
+      const ask = Number(p?.ask);
+      if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0 && ask >= bid) {
+        out[coin] = { t, bid, ask };
       }
     }
     if (!out.btc || !out.eth) return null;
@@ -201,7 +193,7 @@ function sellAll(st: StratState, id: string, coin: Coin, tick: Tick, reason: str
 
 function equityOf(st: StratState, ticks: Ticks): number {
   let eq = st.cash;
-  for (const c of COINS) {
+  for (const c of Object.keys(st.positions)) {
     const pos = st.positions[c];
     if (pos) eq += pos.units * (ticks[c]?.bid ?? pos.entry);
   }
@@ -316,7 +308,7 @@ function activeEntryBlockReason(st: StratState, coin: Coin, tick: Tick, recents:
 
 function internalSignal(coin: Coin, recents: Record<Coin, Tick[]>, ticks: Ticks): CoinSignal | null {
   if (!ticks[coin]) return null;
-  const xs   = recents[coin].map(mid);
+  const xs   = recents[coin]?.map(mid) ?? [];
   const curr = xs[xs.length - 1] ?? 0;
 
   let momentum24h = 0;
@@ -364,7 +356,7 @@ function minScalpTakeProfitPct(tick: Tick, pos: Position): number {
 
 function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Tick[]>, externalSignals: CoinSignal[] | null) {
   const S          = state.strategies;
-  const available  = COINS.filter((c) => ticks[c]);
+  const available  = tickCoins(ticks);
   const regime     = marketRegime(recents, ticks);
 
   const sigMap: Record<string, CoinSignal> = {};
@@ -405,7 +397,7 @@ function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Ti
   const smaSt = S.sma;
   if (!strategyDrawdownBlocked(smaSt, ticks)) {
     for (const c of available) {
-      const xs = recents[c].map(mid);
+      const xs = recents[c]?.map(mid) ?? [];
       const fast = smaOf(xs, SMA_FAST), slow = smaOf(xs, SMA_SLOW);
       const fp = xs.length > 1 ? smaOf(xs.slice(0,-1), SMA_FAST) : null;
       const sp = xs.length > 1 ? smaOf(xs.slice(0,-1), SMA_SLOW) : null;
@@ -534,8 +526,9 @@ export async function runTick(externalSignals?: CoinSignal[]): Promise<{ ok: boo
   if (state.lastTick && now - state.lastTick < 240) return { ok: false, detail: 'tick throttled (ran <4 min ago)' };
 
   const recents = {} as Record<Coin, Tick[]>;
-  for (const c of COINS) recents[c] = await loadRecent(c);
-  for (const c of COINS) { const tk = ticks[c]; if (tk) await appendHistory(c, tk, recents[c]); }
+  const coins = tickCoins(ticks);
+  for (const c of coins) recents[c] = await loadRecent(c);
+  for (const c of coins) { const tk = ticks[c]; if (tk) await appendHistory(c, tk, recents[c] ?? []); }
 
   runStrategies(state, ticks, recents, externalSignals ?? null);
   state.lastTick  = now;
@@ -546,8 +539,9 @@ export async function runTick(externalSignals?: CoinSignal[]): Promise<{ ok: boo
 
 export async function currentSignals(ticks: Ticks): Promise<CoinSignal[]> {
   const recents = {} as Record<Coin, Tick[]>;
-  for (const c of COINS) recents[c] = await loadRecent(c);
-  return COINS.filter((c) => ticks[c]).map((c) => internalSignal(c, recents, ticks)).filter(Boolean) as CoinSignal[];
+  const coins = tickCoins(ticks);
+  for (const c of coins) recents[c] = await loadRecent(c);
+  return coins.map((c) => internalSignal(c, recents, ticks)).filter(Boolean) as CoinSignal[];
 }
 
 export function summarise(state: PaperState, ticks: Ticks) {
@@ -570,7 +564,7 @@ export function summarise(state: PaperState, ticks: Ticks) {
       wins: st.wins, losses: st.losses,
       openPositions: Object.fromEntries(
         Object.entries(st.positions).map(([c, p]) =>
-          [c, { units: p!.units, entry: p!.entry, markToBid: ticks[c as Coin]?.bid ?? p!.entry, entryTick: p!.entryTick }])
+          [c, { units: p!.units, entry: p!.entry, markToBid: ticks[c]?.bid ?? p!.entry, entryTick: p!.entryTick }])
       ),
       trades: st.trades.slice().reverse(),
       tradeCount: st.trades.length,
