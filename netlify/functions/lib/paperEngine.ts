@@ -521,7 +521,8 @@ export function summarise(state: PaperState, ticks: Ticks) {
         Object.entries(st.positions).map(([c, p]) =>
           [c, { units: p!.units, entry: p!.entry, markToBid: ticks[c as Coin]?.bid ?? p!.entry, entryTick: p!.entryTick }])
       ),
-      trades: st.trades.slice(-50).reverse(),
+      trades: st.trades.slice().reverse(),
+      tradeCount: st.trades.length,
       equityHistory: st.equity,
     };
   }
