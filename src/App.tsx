@@ -11,11 +11,13 @@ const COLORS: Record<string, string> = {
 
 interface StratView {
   name: string; blurb: string; cash: number; startCash: number; equity: number; returnPct: number;
-  realisedPnl: number; wins: number; losses: number;
+  realisedPnl: number; wins: number; losses: number; tradeCount?: number;
   openPositions: Record<string, { units: number; entry: number; markToBid: number; entryTick?: number }>;
   trades: { t: number; coin: string; side: string; units: number; price: number; fee: number; reason: string; strategy: string }[];
   equityHistory: [number, number][];
 }
+
+type TradeRow = StratView['trades'][number] & { strategyId: string; strategyName: string };
 
 interface Signal {
   coin: string;
@@ -40,6 +42,119 @@ interface StateResponse {
 
 const aud = (n: number) => n.toLocaleString('en-AU', { style: 'currency', currency: 'AUD' });
 const ts = (t: number) => new Date(t * 1000).toLocaleString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+function pdfSafe(value: string): string {
+  return value
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+}
+
+function wrapLine(value: string, width = 104): string[] {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (clean.length <= width) return [clean];
+  const words = clean.split(' ');
+  const lines: string[] = [];
+  let line = '';
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (next.length > width && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function buildTradeHistoryPdf(trades: TradeRow[], data: StateResponse | null): string {
+  const pageLines: string[][] = [];
+  let lines: string[] = [];
+  const maxLines = 49;
+  const push = (line = '') => {
+    if (lines.length >= maxLines) {
+      pageLines.push(lines);
+      lines = [];
+    }
+    lines.push(line);
+  };
+
+  push('Scarlett Paper Trader - Full Trade History');
+  push(`Generated: ${new Date().toLocaleString('en-AU')}`);
+  push(`Last tick: ${data?.lastTick ? ts(data.lastTick) : 'Not available'} | Ticks: ${data?.tickCount ?? 0} | Trades: ${trades.length}`);
+  push('');
+  push('When              Strategy              Side Coin Units        Price        Fee       Reason');
+  push('--------------------------------------------------------------------------------------------------------');
+
+  if (trades.length === 0) {
+    push('No simulated trades yet.');
+  }
+
+  for (const trade of trades) {
+    const left = [
+      ts(trade.t).padEnd(17).slice(0, 17),
+      trade.strategyName.padEnd(21).slice(0, 21),
+      trade.side.padEnd(4).slice(0, 4),
+      trade.coin.toUpperCase().padEnd(4).slice(0, 4),
+      trade.units.toFixed(6).padStart(11).slice(0, 11),
+      aud(trade.price).padStart(12).slice(0, 12),
+      aud(trade.fee).padStart(9).slice(0, 9),
+    ].join(' ');
+    const wrapped = wrapLine(`${left}  ${trade.reason}`, 112);
+    for (const [index, line] of wrapped.entries()) {
+      push(index === 0 ? line : `                                                                                  ${line}`);
+    }
+  }
+
+  if (lines.length) pageLines.push(lines);
+
+  const contentObjects = pageLines.map((page, index) => {
+    const yStart = 806;
+    const body = page.map((line, lineIndex) => `1 0 0 1 36 ${yStart - lineIndex * 15} Tm (${pdfSafe(line)}) Tj`).join('\n');
+    return `BT\n/F1 ${index === 0 ? 9.5 : 8.8} Tf\n${body}\nET`;
+  });
+
+  const objects: string[] = [];
+  objects.push('<< /Type /Catalog /Pages 2 0 R >>');
+  const pageObjectNumbers = contentObjects.map((_, index) => 5 + index * 2);
+  objects.push(`<< /Type /Pages /Kids [${pageObjectNumbers.map((n) => `${n} 0 R`).join(' ')}] /Count ${pageObjectNumbers.length} >>`);
+  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>');
+
+  for (const [index, content] of contentObjects.entries()) {
+    const contentObj = 4 + index * 2;
+    objects.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentObj} 0 R >>`);
+  }
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefAt = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  offsets.slice(1).forEach((offset) => { pdf += `${String(offset).padStart(10, '0')} 00000 n \n`; });
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF`;
+  return pdf;
+}
+
+function downloadTradeHistoryPdf(trades: TradeRow[], data: StateResponse | null) {
+  const pdf = buildTradeHistoryPdf(trades, data);
+  const blob = new Blob([pdf], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `scarlett-paper-trader-trade-history-${stamp}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
 function EquityChart({ strategies }: { strategies: Record<string, StratView> }) {
   const series = Object.entries(strategies)
@@ -194,12 +309,11 @@ export default function App() {
     setBusy(false);
   };
 
-  const allTrades = useMemo(() => {
+  const allTrades = useMemo<TradeRow[]>(() => {
     if (!data?.strategies) return [];
-    return Object.values(data.strategies)
-      .flatMap((s) => s.trades)
-      .sort((a, b) => b.t - a.t)
-      .slice(0, 50);
+    return Object.entries(data.strategies)
+      .flatMap(([strategyId, s]) => s.trades.map((trade) => ({ ...trade, strategyId, strategyName: s.name })))
+      .sort((a, b) => b.t - a.t);
   }, [data]);
 
   return (
@@ -277,27 +391,37 @@ export default function App() {
           </section>
 
           <section className="card">
-            <h2>Recent simulated trades — all strategies</h2>
+            <div className="card-head">
+              <div>
+                <h2>Full simulated trade history — all strategies</h2>
+                <p className="dim trade-count">Showing every stored trade currently returned by the paper engine: {allTrades.length} total.</p>
+              </div>
+              <button className="ghost" onClick={() => downloadTradeHistoryPdf(allTrades, data)} disabled={allTrades.length === 0}>
+                Download PDF
+              </button>
+            </div>
             {allTrades.length === 0 ? (
               <p className="dim">No trades yet. Most strategies need 6–24 hours of price history before their first signal — this is expected, not broken. The scalper fires after 15 ticks (~75 min).</p>
             ) : (
-              <table>
-                <thead><tr><th>When</th><th>Strategy</th><th>Side</th><th>Coin</th><th>Units</th><th>Price</th><th>Fee</th><th>Reason</th></tr></thead>
-                <tbody>
-                  {allTrades.map((t, i) => (
-                    <tr key={i} style={t.strategy === 'scalper' ? { background: 'rgba(123,94,167,0.06)' } : undefined}>
-                      <td>{ts(t.t)}</td>
-                      <td>{t.strategy}</td>
-                      <td className={t.side === 'buy' ? 'up' : 'down'}>{t.side}</td>
-                      <td>{t.coin.toUpperCase()}</td>
-                      <td>{t.units.toFixed(6)}</td>
-                      <td>{aud(t.price)}</td>
-                      <td>{aud(t.fee)}</td>
-                      <td className="dim">{t.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="table-wrap">
+                <table>
+                  <thead><tr><th>When</th><th>Strategy</th><th>Side</th><th>Coin</th><th>Units</th><th>Price</th><th>Fee</th><th>Reason</th></tr></thead>
+                  <tbody>
+                    {allTrades.map((t, i) => (
+                      <tr key={`${t.strategyId}-${t.t}-${t.side}-${t.coin}-${i}`} style={t.strategyId === 'scalper' ? { background: 'rgba(123,94,167,0.06)' } : undefined}>
+                        <td>{ts(t.t)}</td>
+                        <td>{t.strategyName}</td>
+                        <td className={t.side === 'buy' ? 'up' : 'down'}>{t.side}</td>
+                        <td>{t.coin.toUpperCase()}</td>
+                        <td>{t.units.toFixed(6)}</td>
+                        <td>{aud(t.price)}</td>
+                        <td>{aud(t.fee)}</td>
+                        <td className="dim">{t.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </section>
         </>
