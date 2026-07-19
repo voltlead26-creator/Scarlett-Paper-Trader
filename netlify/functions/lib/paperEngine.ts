@@ -7,6 +7,7 @@
  * simulated strategies, while BTC/ETH remain required for market-regime checks.
  */
 import { getStore } from '@netlify/blobs';
+import { fetchEquityTicks, isEquity } from './nasdaq';
 
 export type Coin = string;
 export type Ticks = Partial<Record<Coin, Tick>>;
@@ -19,7 +20,7 @@ const RECENT_CAP    = TICKS_PER_DAY * 8;
 const TRADES_CAP    = 1200;
 const EQUITY_CAP    = 2400;
 const DUST          = 5;
-const STATE_VERSION = 9;
+const STATE_VERSION = 10;
 
 const DCA_INTERVAL_TICKS = 48;
 const DCA_ALLOC          = 35;
@@ -85,9 +86,9 @@ export const STRATEGY_IDS = ['hold','dca','sma','momentum','meanrev','scalper'] 
 
 export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
   hold:     { name: 'Buy & Hold', blurb: 'Benchmark. 50/50 BTC/ETH at first tick, never trades again.' },
-  dca:      { name: 'Active DCA Rebalancer', blurb: `Every ${DCA_INTERVAL_TICKS} ticks (~4h), adds small buys into the strongest CoinSpot markets and trims positions on quick profit, thesis failure, or protected stop.` },
+  dca:      { name: 'Active DCA Rebalancer', blurb: `Every ${DCA_INTERVAL_TICKS} ticks (~4h), adds small buys into the strongest CoinSpot markets and Nasdaq watchlist names (during US session) and trims positions on quick profit, thesis failure, or protected stop.` },
   sma:      { name: 'Fast SMA Profit Lock', blurb: '1-hour vs 6-hour crossover strategy with spread-aware entries, quick profit lock, death-cross exit, and protected stops.' },
-  momentum: { name: 'Momentum Profit Harvester', blurb: 'Buys the strongest short-term movers, takes small wins quickly, and exits when momentum fades instead of waiting for a large reversal.' },
+  momentum: { name: 'Momentum Profit Harvester', blurb: 'Buys the strongest short-term movers across crypto and the Nasdaq watchlist, takes small wins quickly, and exits when momentum fades instead of waiting for a large reversal.' },
   meanrev:  { name: 'Mean Reversion Bounce', blurb: 'Buys oversold bounce setups only after a rebound begins, then exits at a small profit, time limit, or tight protected stop.' },
   scalper:  { name: 'Active Micro-Scalper', blurb: `High-activity micro day-trading across every CoinSpot market with a valid public bid/ask. Targets 50-150 trades/day with a ${SC_DAILY_TRADE_CAP}/day safety cap. $${SC_ALLOC} AUD entries, exits as soon as net profit is positive after fees/spread, or at protected stop/time exit. Rebuy-higher after stops remains blocked unless the setup is materially stronger.` },
 };
@@ -95,7 +96,7 @@ export const STRATEGY_META: Record<string, { name: string; blurb: string }> = {
 const store  = () => getStore('paper-trading');
 const dayKey = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
 const mid    = (k: Tick)   => (k.bid + k.ask) / 2;
-const isMajor = (coin: Coin) => coin === 'btc' || coin === 'eth';
+const isMajor = (coin: Coin) => coin === 'btc' || coin === 'eth' || isEquity(coin);
 const tickCoins = (ticks: Ticks): Coin[] => Object.keys(ticks).filter((c) => Boolean(ticks[c]));
 
 export async function fetchPrices(): Promise<Ticks | null> {
@@ -299,6 +300,11 @@ function blockedByCooldown(st: StratState, coin: Coin, tick: Tick, nextSetupScor
 
 function activeEntryBlockReason(st: StratState, coin: Coin, tick: Tick, recents: Record<Coin, Tick[]>, ticks: Ticks, regime: string, setupScore: number): string | null {
   if (!hasMatureHistory(recents, coin)) return 'blocked: less than 3h history';
+  if (isEquity(coin)) {
+    const rec = recents[coin];
+    const prev = rec && rec.length >= 2 ? rec[rec.length - 2] : null;
+    if (prev && tick.t - prev.t > 20 * 60) return 'blocked: gapped equity history (session open transition)';
+  }
   const sp = spreadPct(tick);
   if (sp > MAX_ACTIVE_SPREAD_PCT) return `blocked: spread ${(sp * 100).toFixed(2)}% too wide`;
   if (regime === 'risk_off' && !isMajor(coin) && setupScore < ALT_RISK_OFF_SCORE) return `blocked: altcoin risk-off setup too weak (${setupScore.toFixed(3)})`;
@@ -490,6 +496,7 @@ function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Ti
     const todayTrades = tradesToday(sc, ticks.btc!.t);
     if (todayTrades < SC_DAILY_TRADE_CAP && Object.keys(sc.positions).length < SC_MAX_OPEN && sc.cash >= SC_ALLOC) {
       for (const c of available) {
+        if (isEquity(c)) continue; // delayed quotes; equities are swing-only
         if (sc.positions[c] || Object.keys(sc.positions).length >= SC_MAX_OPEN || sc.cash < SC_ALLOC || tradesToday(sc, ticks.btc!.t) >= SC_DAILY_TRADE_CAP) continue;
         const tick = ticks[c]!;
         const sig = sigMap[c];
@@ -522,6 +529,10 @@ function runStrategies(state: PaperState, ticks: Ticks, recents: Record<Coin, Ti
 export async function runTick(externalSignals?: CoinSignal[]): Promise<{ ok: boolean; detail: string }> {
   const ticks = await fetchPrices();
   if (!ticks?.btc) return { ok: false, detail: 'CoinSpot price fetch failed; tick skipped' };
+  // Nasdaq watchlist (research report Tier A/B). Only yields ticks during the
+  // live US regular session; delayed quotes, swing strategies only.
+  const equityTicks = await fetchEquityTicks();
+  for (const [k, v] of Object.entries(equityTicks)) ticks[k] = v;
 
   const now = ticks.btc.t;
   let state = await loadState();
